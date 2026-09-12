@@ -76,3 +76,13 @@ export class WorkspaceService {
     return this.db.select().from(agents).where(eq(agents.workspaceId, workspaceId)) as Promise<Agent[]>;
   }
 }
+
+/**
+ * 读取工作区根目录（Phase 3 部署/数据库模块共用）。
+ * rootPath 为 null 时返回 null：调用方必须给出「请先在设置中选择工作区目录」的可读错误，
+ * 而不是默默写到进程 cwd（避免污染仓库目录）。
+ */
+export async function workspaceRoot(db: Db, workspaceId: string): Promise<string | null> {
+  const rows = await db.select().from(workspaces).where(eq(workspaces.id, workspaceId)).limit(1);
+  return rows[0]?.rootPath ?? null;
+}

@@ -355,37 +355,6 @@ export const artifacts = sqliteTable(
 /* ------------------------------------------------------------------ */
 /* 网站 / 数据库连接                                                   */
 /* ------------------------------------------------------------------ */
-export const websites = sqliteTable(
-  'websites',
-  {
-    id: id(),
-    workspaceId: text('workspace_id')
-      .notNull()
-      .references(() => workspaces.id, { onDelete: 'cascade' }),
-    goalId: text('goal_id'),
-    name: text('name').notNull(),
-    provider: text('provider', {
-      enum: ['vercel', 'cloudflare-pages', 'netlify', 'local-preview'],
-    })
-      .notNull()
-      .default('local-preview'),
-    databaseConnectionId: text('database_connection_id'),
-    status: text('status', {
-      enum: ['creating', 'building', 'deployed', 'failed', 'deleted'],
-    })
-      .notNull()
-      .default('creating'),
-    url: text('url'),
-    customDomain: text('custom_domain'),
-    accessControl: text('access_control', { enum: ['public', 'password', 'private'] })
-      .notNull()
-      .default('private'),
-    buildLog: text('build_log').notNull().default(''),
-    createdAt: createdAt(),
-    updatedAt: updatedAt(),
-  },
-  (t) => ({ wsIdx: index('websites_ws_idx').on(t.workspaceId) }),
-);
 
 export const databaseConnections = sqliteTable(
   'database_connections',
@@ -402,6 +371,15 @@ export const databaseConnections = sqliteTable(
     database: text('database'),
     ssl: integer('ssl', { mode: 'boolean' }).notNull().default(true),
     createdAt: createdAt(),
+    /** Phase 3：供应商与状态 */
+    provider: text('provider').notNull().default('neon'),
+    status: text('status', { enum: ['unconfigured', 'ok', 'error', 'migrating'] }).notNull().default('unconfigured'),
+    /** Phase 3：加密后的连接配置（AES-256-GCM） */
+    encryptedConfig: text('encrypted_config'),
+    schemaJson: json('schema_json').$type<Record<string, unknown>>().notNull().default({}),
+    schemaVersion: integer('schema_version').notNull().default(0),
+    lastTestedAt: text('last_tested_at'),
+    updatedAt: updatedAt(),
   },
   (t) => ({ wsIdx: index('db_conn_ws_idx').on(t.workspaceId) }),
 );
@@ -427,6 +405,14 @@ export const schedules = sqliteTable(
     retry: integer('retry').notNull().default(2),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
+    /** Phase 3：时区 / 任务类型 / 参数 / 模板 / 重试策略 */
+    timezone: text('timezone').notNull().default('Asia/Shanghai'),
+    taskType: text('task_type').notNull().default('goal'),
+    taskConfig: json('task_config').$type<Record<string, unknown>>().notNull().default({}),
+    template: text('template'),
+    retryPolicy: json('retry_policy').$type<Record<string, unknown>>().notNull().default({}),
+    concurrency: integer('concurrency').notNull().default(1),
+    interruptedAt: text('interrupted_at'),
   },
   (t) => ({ wsIdx: index('schedules_ws_idx').on(t.workspaceId) }),
 );
@@ -445,6 +431,11 @@ export const scheduleRuns = sqliteTable(
     log: text('log').notNull().default(''),
     startedAt: text('started_at').notNull(),
     finishedAt: text('finished_at'),
+    /** Phase 3：重试与结构化结果 */
+    retryCount: integer('retry_count').notNull().default(0),
+    result: json('result').$type<Record<string, unknown> | null>(),
+    error: text('error'),
+    trigger: text('trigger').notNull().default('auto'),
   },
   (t) => ({ schedIdx: index('schedule_runs_sched_idx').on(t.scheduleId) }),
 );
@@ -469,6 +460,11 @@ export const widgets = sqliteTable(
     refreshIntervalMs: integer('refresh_interval_ms').notNull().default(5000),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
+    /** Phase 3：位置 / 尺寸 / 数据源 / 启用 */
+    position: integer('position').notNull().default(0),
+    size: text('size').notNull().default('md'),
+    dataSource: text('data_source').notNull().default('local'),
+    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
   },
   (t) => ({ wsIdx: index('widgets_ws_idx').on(t.workspaceId) }),
 );
@@ -573,24 +569,6 @@ export const auditLogs = sqliteTable(
 );
 
 /** 通知渠道配置（Phase 3 推送用） */
-export const notificationChannels = sqliteTable(
-  'notification_channels',
-  {
-    id: id(),
-    workspaceId: text('workspace_id')
-      .notNull()
-      .references(() => workspaces.id, { onDelete: 'cascade' }),
-    kind: text('kind', { enum: ['desktop', 'email', 'webhook', 'feishu', 'dingtalk', 'wecom'] })
-      .notNull(),
-    name: text('name').notNull(),
-    /** 密钥引用名，真实值在 Keychain */
-    secretRef: text('secret_ref'),
-    secretValueEnc: text('secret_value_enc'),
-    enabled: integer('enabled', { mode: 'boolean' }).notNull().default(true),
-    createdAt: createdAt(),
-  },
-  (t) => ({ wsIdx: index('channels_ws_idx').on(t.workspaceId) }),
-);
 
 /* ================================================================== */
 /* Phase 2 增量表                                                      */
@@ -806,3 +784,22 @@ export const researchReports = sqliteTable(
   },
   (t) => ({ jobIdx: uniqueIndex('research_reports_job_idx').on(t.researchJobId) }),
 );
+
+/* ================================================================== */
+/* Phase 3 增量表（交付与自动化）                                       */
+/* ================================================================== */
+export {
+  websiteProjects,
+  websiteBuilds,
+  websiteDeployments,
+  websiteAccessRules,
+  databaseSchemas,
+  databaseMigrations,
+  dashboards,
+  widgetDataSources,
+  notifyChannels,
+  notifyLogs,
+  deployAudits,
+  dbAudits,
+  scheduleAudits,
+} from './phase3.ts';

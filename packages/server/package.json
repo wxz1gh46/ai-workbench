@@ -20,7 +20,14 @@
     "test:research": "node --test --experimental-transform-types \"src/research/**/*.test.ts\"",
     "test:office": "node --test --experimental-transform-types \"src/office/**/*.test.ts\"",
     "test:goals": "node --test --experimental-transform-types \"src/goals/**/*.test.ts\"",
-    "verify:rollback": "tsx scripts/verify-rollback.ts"
+    "verify:rollback": "tsx scripts/verify-rollback.ts",
+    "test:phase3": "node --test --experimental-transform-types \"src/deploy/**/*.test.ts\" \"src/database/**/*.test.ts\" \"src/dashboard/**/*.test.ts\" \"src/schedule/**/*.test.ts\" \"src/notify/**/*.test.ts\" \"test/phase3-*.test.ts\"",
+    "test:deploy": "node --test --experimental-transform-types \"src/deploy/**/*.test.ts\"",
+    "test:notify": "node --test --experimental-transform-types \"src/notify/**/*.test.ts\"",
+    "test:schedule": "node --test --experimental-transform-types \"src/schedule/**/*.test.ts\"",
+    "test:dashboard": "node --test --experimental-transform-types \"src/dashboard/**/*.test.ts\"",
+    "test:database": "node --test --experimental-transform-types \"src/database/**/*.test.ts\"",
+    "verify:phase3": "tsx scripts/verify-phase3.ts"
   },
   "dependencies": {
     "@ai/shared": "workspace:*",
@@ -35,7 +42,9 @@
     "pdf-lib": "^1.17.1",
     "pptxgenjs": "^3.12.0",
     "ws": "^8.18.0",
-    "zod": "^3.23.8"
+    "zod": "^3.23.8",
+    "nodemailer": "^6.9.16",
+    "pg": "^8.13.1"
   },
   "devDependencies": {
     "@types/better-sqlite3": "^7.6.11",
@@ -43,6 +52,8 @@
     "@types/ws": "^8.5.13",
     "drizzle-kit": "^0.28.1",
     "tsx": "^4.19.2",
-    "typescript": "^5.6.3"
+    "typescript": "^5.6.3",
+    "@types/nodemailer": "^6.4.17",
+    "@types/pg": "^8.11.10"
   }
 }

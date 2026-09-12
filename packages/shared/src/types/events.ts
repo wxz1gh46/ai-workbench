@@ -32,6 +32,20 @@ export const EventType = {
   RESEARCH_REPORT: 'research.report',
   LOG: 'log',
   ERROR: 'error',
+  /* Phase 3 新增事件 */
+  WEBSITE_GENERATED: 'website.generated',
+  WEBSITE_BUILD_LOG: 'website.build-log',
+  DEPLOY_STATUS: 'deploy.status',
+  DEPLOY_LOG: 'deploy.log',
+  DB_STATUS: 'database.status',
+  DB_MIGRATION: 'database.migration',
+  DASHBOARD_UPDATED: 'dashboard.updated',
+  WIDGET_UPDATED: 'widget.updated',
+  WIDGET_REFRESHED: 'widget.refreshed',
+  SCHEDULE_UPDATED: 'schedule.updated',
+  SCHEDULE_LOG: 'schedule.log',
+  NOTIFY_SENT: 'notify.sent',
+  NOTIFY_FAILED: 'notify.failed',
 } as const;
 
 export type EventTypeValue = (typeof EventType)[keyof typeof EventType];

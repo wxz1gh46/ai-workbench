@@ -4,6 +4,8 @@ import { logger as honoLogger } from 'hono/logger';
 import { EventType, type ApiResponse, type Artifact } from '@ai/shared';
 import { getDb, type Db } from '../db/client.ts';
 import { runMigrations } from '../db/migrate.ts';
+import { eq } from 'drizzle-orm';
+import { goals } from '../db/schema/index.ts';
 import { GoalService } from '../agent/goal-service.ts';
 import { GoalEngine } from '../goals/goalEngine.ts';
 import { OfficeService } from '../office/officeService.ts';
@@ -26,6 +28,18 @@ import { logger } from '../utils/logger.ts';
 import { fail, ok, parseJson } from '../utils/http.ts';
 import { newId } from '../utils/ids.ts';
 import { config } from '../config.ts';
+import { DeployService } from '../deploy/deployService.ts';
+import { DatabaseService } from '../database/databaseService.ts';
+import { DashboardService } from '../dashboard/dashboardService.ts';
+import { ScheduleManager } from '../schedule/scheduleService.ts';
+import { JobRunner } from '../schedule/jobRunner.ts';
+import { NotifyService } from '../notify/notifyService.ts';
+import { gate, dangerCatalog } from '../security/dangerGate.ts';
+import { QueryRunner } from '../database/queryRunner.ts';
+import { auditors } from '../audit/index.ts';
+import { WebsiteProjectService } from '../deploy/projectService.ts';
+import { computeStats, buildTimeline } from '../schedule/jobLog.ts';
+import type { WebsitePlan } from '@ai/shared';
 import { readFile } from 'node:fs/promises';
 import { safeJoin } from '../tools/fs-tools.ts';
 import * as S from './schemas.ts';
@@ -50,6 +64,54 @@ export function createApp(deps: AppDeps = {}) {
   const prompts = new PromptService(db);
   const pluginService = new PluginService(db);
   const audit = new AuditService(db);
+  /* Phase 3 服务实例 */
+  const notify = new NotifyService(db);
+  const database = new DatabaseService(db);
+  const jobRunner = new JobRunner(db, {
+    runGoal: async (i) => {
+      const created = await goalService.createGoal({ workspaceId: i.workspaceId, objective: i.objective, acceptanceCriteria: i.acceptanceCriteria, autoRun: false });
+      const goalId = created.goal.id;
+      if (i.maxIterations) {
+        await db.update(goals).set({ maxIterations: i.maxIterations }).where(eq(goals.id, goalId));
+      }
+      await goalService.advanceUntilFinished(goalId);
+      const fresh = await goalService.getGoal(goalId);
+      return { goalId, status: fresh.status, progress: fresh.progress };
+    },
+    runResearch: async (i) => {
+      const job = await research.create({ workspaceId: i.workspaceId, topic: i.topic, depth: i.depth as 'standard', allowNetwork: i.allowNetwork });
+      return { jobId: job.id, status: job.status };
+    },
+    runOffice: async (i) => {
+      const ws = await workspaceService.getById(i.workspaceId);
+      if (!ws.rootPath) throw AppError.badRequest('工作区未设置 rootPath，无法生成文件');
+      const gen = await office.generate(
+        { workspaceId: i.workspaceId, workspaceRoot: ws.rootPath },
+        { format: i.format as 'docx', title: i.title, content: i.content },
+      );
+      return { path: gen.path, bytes: gen.bytes };
+    },
+    runDeploy: async (i) => {
+      const res = await deploy.deploy({ websiteProjectId: i.websiteProjectId, provider: i.provider as 'vercel', confirm: true });
+      return { url: res.deployment.url ?? '', status: res.deployment.status };
+    },
+    runQuery: async (i) => {
+      const r = await database.runQuery({ workspaceId: i.workspaceId, id: i.connectionId, sql: i.sql, readOnly: true, limit: i.limit });
+      return { columns: r.columns, rows: r.rows, rowCount: r.rowCount };
+    },
+  });
+  const deploy = new DeployService(db);
+  const scheduleManagerV3 = new ScheduleManager(db, jobRunner);
+  const dashboards = new DashboardService(db, {
+    runQuery: async (i) => database.runQuery({ ...i, workspaceId: i.workspaceId, id: i.id, sql: i.sql, readOnly: i.readOnly, limit: i.limit }),
+  });
+  const projects = new WebsiteProjectService(db);
+  const auditorsV3 = auditors(db);
+  const { deploy: deployAuditor, db: dbAuditor, schedule: scheduleAuditor } = auditorsV3;
+  
+  const auditorDeploy = deployAuditor;
+  const auditorDb = dbAuditor;
+  const auditorSchedule = scheduleAuditor;
 
   registerBuiltinTools();
 
@@ -634,13 +696,21 @@ export function createApp(deps: AppDeps = {}) {
   app.post('/research/:id/cancel', async (c) => ok(c, { job: await research.cancel(c.req.param('id')) }));
 
   /* ----------------------------- 网站部署 -------------------------- */
-  app.post('/website/deploy', async (c) => {
-    const body = await parseJson(c, S.isDeployWebsiteRequest, 'website');
-    if (!config.features.phase3Deploy) {
-      throw AppError.badRequest('网站部署将在 Phase 3 交付（需用户配置 Vercel/Cloudflare Token 与 Neon/Supabase 连接）');
-    }
-    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'website.deploy', targetType: 'website', targetId: null, confirmedByUser: body.confirm, detail: { description: body.description, provider: body.provider ?? 'vercel' } });
-    return ok(c, { accepted: true, note: '部署任务已进入队列（Phase 3 实现具体 Provider 适配）' }, 202);
+  /*
+   * Phase 1 的 /website/deploy 占位接口已彻底移除。
+   *
+   * 原因（真实缺陷）：它返回 202 + accepted:true，但什么都没做 ——
+   * 前端会显示「已进入队列」，用户以为部署成功了。Phase 3 的真实入口是：
+   *   POST /websites           创建项目
+   *   POST /websites/:id/generate
+   *   POST /websites/:id/deploy   ← 真实部署
+   * 这里返回 410 明确告知迁移路径，避免调用方静默拿到假成功。
+   */
+  app.post('/website/deploy', (c) => {
+    throw AppError.badRequest(
+      '接口已迁移：请改用 POST /websites 创建项目 → POST /websites/:id/generate 生成 → POST /websites/:id/deploy 部署',
+      { deprecated: '/website/deploy', replacements: ['POST /websites', 'POST /websites/:id/generate', 'POST /websites/:id/deploy'] },
+    );
   });
 
   /* ----------------------------- 定时任务 -------------------------- */
@@ -699,27 +769,20 @@ export function createApp(deps: AppDeps = {}) {
   });
 
   /* ------------------------------ 看板 ----------------------------- */
+  /*
+   * 说明：Phase 1 的 /widgets 简版路由已被 Phase 3（/dashboards/:id/widgets +
+   * /widgets/:id）完整取代。这里保留一段兼容层：老前端（Phase 1 UI）调用的
+   * POST /widgets 仍然可用，由 DashboardsService 处理；其余同名路由已删除，
+   * 避免「先声明的路由遮蔽后声明的路由」造成 404/行为不一致（真实踩坑）。
+   */
   app.post('/widgets', async (c) => {
     const body = await parseJson(c, S.isCreateWidgetRequest, 'widget');
-    return ok(c, { widget: await widgets.createFromNaturalLanguage(body) }, 201);
-  });
-
-  app.get('/widgets', async (c) => {
-    const workspaceId = c.req.query('workspaceId');
-    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
-    return ok(c, { widgets: await widgets.list(workspaceId, c.req.query('dashboardId') ?? 'default') });
-  });
-
-  app.patch('/widgets/:id', async (c) => {
-    const body = (await c.req.json().catch(() => ({}))) as { layout?: { x: number; y: number; w: number; h: number } };
-    if (!body.layout) throw AppError.badRequest('缺少 layout');
-    await widgets.updateLayout(c.req.param('id'), body.layout);
-    return ok(c, { updated: true });
-  });
-
-  app.delete('/widgets/:id', async (c) => {
-    await widgets.remove(c.req.param('id'));
-    return ok(c, { removed: true });
+    const result = await dashboards.createFromNaturalLanguage({
+      workspaceId: body.workspaceId,
+      naturalLanguage: body.naturalLanguage,
+      dashboardId: body.dashboardId,
+    });
+    return ok(c, { widget: (result as unknown as { widget: unknown }).widget }, 201);
   });
 
   /* ------------------------------ 审计 ----------------------------- */
@@ -730,6 +793,533 @@ export function createApp(deps: AppDeps = {}) {
   });
 
   app.get('/events/recent', (c) => ok(c, { events: eventBus.recent(Number(c.req.query('limit') ?? 100)) }));
+
+
+  /* ================================================================== */
+  /* Phase 3：网站生成 / 部署 / 数据库 / 看板 / 定时任务 / 通知          */
+  /* ================================================================== */
+
+  /* --------------------------- 部署中心 --------------------------- */
+  /**
+   * Phase 3 功能开关中间件式校验：
+   * 关闭后接口返回「未启用」，但数据保留（无需回滚数据库）。
+   * 注意：只对「会产生外部影响」的入口做开关，查询类接口保持可用，
+   * 便于用户查看历史数据。
+   */
+  const requireFeature = (key: keyof typeof config.features, label: string) => {
+    if (!config.features[key]) {
+      throw AppError.badRequest(`${label} 已被功能开关关闭（config.features.${String(key)} = false）；历史数据仍保留，重新打开即可恢复`);
+    }
+  };
+
+  app.get('/deploy/capabilities', async (c) => ok(c, { providers: deploy.capabilities(), danger: dangerCatalog() }));
+
+  app.get('/deploy/providers/test', async (c) => ok(c, { results: await deploy.testProviders() }));
+
+  app.post('/websites', async (c) => {
+    requireFeature('phase3Deploy', '网站部署');
+    const body = await parseJson(c, S.isCreateWebsiteProjectRequest, 'website');
+    const project = await deploy.createProject(body);
+    return ok(c, { project }, 201);
+  });
+
+  app.get('/websites', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { projects: await deploy.listProjects(workspaceId) });
+  });
+
+  app.get('/websites/:id', async (c) => {
+    const project = await deploy.getProject(c.req.param('id'));
+    const [deployments, access, envVars, files] = await Promise.all([
+      deploy.listDeployments(project.id),
+      deploy.getAccess(project.id),
+      deploy.envVars(project.id),
+      projects.listGenerated(project),
+    ]);
+    return ok(c, {
+      project,
+      deployments,
+      access,
+      envVars,
+      files,
+      previewCommand: project.type === 'static' ? 'npm run dev' : 'npm run dev',
+    });
+  });
+
+  app.patch('/websites/:id', async (c) => {
+    const id = c.req.param('id');
+    const body = (await c.req.json().catch(() => ({}))) as { name?: string; description?: string };
+    if (body.name === undefined && body.description === undefined) throw AppError.badRequest('没有需要更新的字段');
+    const project = await projects.update(id, body);
+    return ok(c, { project });
+  });
+
+  app.post('/websites/:id/generate', async (c) => {
+    requireFeature('phase3Deploy', '网站部署');
+    const body = await parseJson(c, S.isGenerateWebsiteRequest, 'generate');
+    const result = await deploy.generate({ websiteProjectId: c.req.param('id'), requirement: body.requirement });
+    return ok(c, result);
+  });
+
+  app.post('/websites/:id/build', async (c) => {
+    requireFeature('phase3Deploy', '网站部署');
+    const project = await deploy.getProject(c.req.param('id'));
+    const result = await projects.build(project);
+    return ok(c, result);
+  });
+
+  app.post('/websites/:id/deploy', async (c) => {
+    requireFeature('phase3Deploy', '网站部署');
+    const body = await parseJson(c, S.isDeployRequest, 'deploy');
+    gate('website.deploy', body.confirm, { websiteProjectId: c.req.param('id'), provider: body.provider });
+    const result = await deploy.deploy({
+      websiteProjectId: c.req.param('id'),
+      provider: body.provider as 'vercel',
+      confirm: body.confirm,
+    });
+    return ok(c, result, 202);
+  });
+
+  app.get('/websites/:id/deployments', async (c) => ok(c, { deployments: await deploy.listDeployments(c.req.param('id')) }));
+
+  app.get('/deployments/:id/logs', async (c) => ok(c, deploy.logs(c.req.param('id'))));
+
+  app.post('/websites/:id/rollback', async (c) => {
+    const body = await parseJson(c, S.isRollbackRequest, 'rollback');
+    gate('website.rollback', body.confirm, { deploymentId: body.deploymentId });
+    const deployment = await deploy.rollback({
+      websiteProjectId: c.req.param('id'),
+      deploymentId: body.deploymentId,
+      confirm: body.confirm,
+    });
+    return ok(c, { deployment });
+  });
+
+  app.delete('/websites/:id/deployments/:deploymentId', async (c) => {
+    const confirm = c.req.query('confirm') === 'true';
+    gate('deployment.delete', confirm, { deploymentId: c.req.param('deploymentId') });
+    const result = await deploy.deleteDeployment({
+      websiteProjectId: c.req.param('id'),
+      deploymentId: c.req.param('deploymentId'),
+      confirm,
+    });
+    return ok(c, result);
+  });
+
+  app.delete('/websites/:id', async (c) => {
+    const confirm = c.req.query('confirm') === 'true';
+    gate('website.delete', confirm, { websiteProjectId: c.req.param('id') });
+    const result = await deploy.deleteProject({ websiteProjectId: c.req.param('id'), confirm });
+    return ok(c, result);
+  });
+
+  app.post('/websites/:id/domain', async (c) => {
+    const body = await parseJson(c, S.isDomainRequest, 'domain');
+    gate('domain.bind', body.confirm, { domain: body.domain });
+    const binding = await deploy.bindDomain({
+      websiteProjectId: c.req.param('id'),
+      domain: body.domain,
+      provider: body.provider as 'vercel' | undefined,
+      confirm: body.confirm,
+    });
+    return ok(c, { binding });
+  });
+
+  app.post('/websites/:id/access', async (c) => {
+    const body = await parseJson(c, S.isAccessRequest, 'access');
+    gate('access.update', body.confirm, { websiteProjectId: c.req.param('id') });
+    const result = await deploy.setAccess({
+      websiteProjectId: c.req.param('id'),
+      rules: body.rules as { type: 'password'; value: string }[],
+      confirm: body.confirm,
+    });
+    return ok(c, result);
+  });
+
+  app.get('/websites/:id/access', async (c) => ok(c, { rules: await deploy.getAccess(c.req.param('id')) }));
+
+  app.get('/websites/:id/env', async (c) => ok(c, { vars: await deploy.envVars(c.req.param('id')) }));
+
+  app.post('/websites/:id/env', async (c) => {
+    const body = await parseJson(c, S.isEnvVarRequest, 'env');
+    const result = await deploy.setEnvVars({ websiteProjectId: c.req.param('id'), vars: body.vars, confirm: body.confirm });
+    return ok(c, result);
+  });
+
+  app.delete('/websites/:id/env/:key', async (c) => {
+    const confirm = c.req.query('confirm') === 'true';
+    if (!confirm) throw AppError.confirmRequired('删除环境变量需要二次确认');
+    return ok(c, await deploy.removeEnvVar({ websiteProjectId: c.req.param('id'), key: c.req.param('key'), confirm }));
+  });
+
+  app.get('/websites/:id/deploy-audits', async (c) => {
+    const project = await deploy.getProject(c.req.param('id'));
+    return ok(c, { audits: await auditorDeploy.list(project.workspaceId, Number(c.req.query('limit') ?? 100)) });
+  });
+
+  /* --------------------------- 数据库面板 ------------------------- */
+  app.get('/databases/providers', (c) => ok(c, { providers: database.providers() }));
+
+  app.post('/databases', async (c) => {
+    requireFeature('phase3Database', '数据库接入');
+    const body = await parseJson(c, S.isCreateDatabaseRequest, 'database');
+    const connection = await database.createConnection({ ...body, provider: body.provider as 'neon' });
+    return ok(c, { connection }, 201);
+  });
+
+  app.get('/databases', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { connections: await database.listConnections(workspaceId) });
+  });
+
+  app.get('/databases/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const connection = await database.getConnection(workspaceId, c.req.param('id'));
+    const [migrations, backups] = await Promise.all([
+      database.listMigrations(workspaceId, connection.id),
+      database.listBackups(workspaceId, connection.id),
+    ]);
+    return ok(c, { connection, migrations, backups });
+  });
+
+  app.delete('/databases/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const confirm = c.req.query('confirm') === 'true';
+    gate('db.delete', confirm, { connectionId: c.req.param('id') });
+    return ok(c, await database.removeConnection({ workspaceId, id: c.req.param('id'), confirm }));
+  });
+
+  app.post('/databases/:id/test', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string };
+    const workspaceId = body.workspaceId ?? c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await database.testConnection({ workspaceId, id: c.req.param('id') }));
+  });
+
+  app.get('/databases/:id/schema', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const connection = await database.getConnection(workspaceId, c.req.param('id'));
+    if (c.req.query('introspect') === 'true') {
+      return ok(c, { schema: await database.introspect({ workspaceId, id: connection.id }) });
+    }
+    return ok(c, { schema: connection, migrations: await database.listMigrations(workspaceId, connection.id) });
+  });
+
+  app.post('/databases/:id/schema', async (c) => {
+    const body = await parseJson(c, S.isCreateSchemaRequest, 'schema');
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const projectId = c.req.query('websiteProjectId');
+    let plan: WebsitePlan | undefined;
+    if (projectId) {
+      const project = await deploy.getProject(projectId);
+      plan = project.plan as unknown as WebsitePlan;
+    }
+    if (!plan && !body.sql) throw AppError.badRequest('需要提供 websiteProjectId（从网站需求生成）或直接的 sql/downSql');
+    if (plan) {
+      const result = await database.generateSchema({ workspaceId, id: c.req.param('id'), plan, withRls: body.withRls });
+      return ok(c, result);
+    }
+    const migration = await database.createMigration({ workspaceId, id: c.req.param('id'), name: body.name, sql: body.sql, downSql: body.downSql });
+    return ok(c, { migration }, 201);
+  });
+
+  app.post('/databases/:id/migrate', async (c) => {
+    const body = await parseJson(c, S.isMigrationRequest, 'migrate');
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('db.migrate', body.confirm, { connectionId: c.req.param('id'), migrationId: body.migrationId });
+    return ok(c, await database.applyMigration({ workspaceId, id: c.req.param('id'), migrationId: body.migrationId, confirm: body.confirm }));
+  });
+
+  app.post('/databases/:id/migrate/rollback', async (c) => {
+    const body = await parseJson(c, S.isMigrationRequest, 'rollback');
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('db.rollback', body.confirm, { connectionId: c.req.param('id'), migrationId: body.migrationId });
+    return ok(c, await database.rollbackMigration({ workspaceId, id: c.req.param('id'), migrationId: body.migrationId, confirm: body.confirm }));
+  });
+
+  app.post('/databases/:id/query', async (c) => {
+    requireFeature('phase3Database', '数据库接入');
+    const body = await parseJson(c, S.isQueryRequest, 'query');
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    if (body.confirm !== true) {
+      const adapter = await database.adapterFor(workspaceId, c.req.param('id'));
+      const preflight = new QueryRunner(adapter).preflight(body.sql, { readOnly: body.readOnly ?? true });
+      return ok(c, { preflight });
+    }
+    const result = await database.runQuery({
+      workspaceId,
+      id: c.req.param('id'),
+      sql: body.sql,
+      params: body.params,
+      readOnly: body.readOnly ?? true,
+      limit: body.limit,
+      confirm: body.confirm,
+    });
+    return ok(c, result);
+  });
+
+  app.post('/databases/:id/backup', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; compress?: boolean; confirm?: boolean };
+    const workspaceId = body.workspaceId ?? c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    if (body.confirm !== true) throw AppError.confirmRequired('备份会读取数据库全部表结构，需要二次确认');
+    return ok(c, await database.backup({ workspaceId, id: c.req.param('id'), compress: body.compress, confirm: true }));
+  });
+
+  app.get('/databases/:id/backups', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { backups: await database.listBackups(workspaceId, c.req.param('id')) });
+  });
+
+  app.post('/backups/:id/restore-plan', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    const connectionId = c.req.query('connectionId');
+    if (!workspaceId || !connectionId) throw AppError.badRequest('缺少 workspaceId / connectionId');
+    return ok(c, await database.planRestore({ workspaceId, id: connectionId, backupId: c.req.param('id') }));
+  });
+
+  app.get('/databases/:id/audits', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { audits: await auditorDb.list(workspaceId, Number(c.req.query('limit') ?? 100)) });
+  });
+
+  /* --------------------------- 看板编辑器 -------------------------- */
+  app.get('/dashboard/registry', (c) => ok(c, { widgets: DashboardService.registry() }));
+
+  app.post('/dashboards', async (c) => {
+    requireFeature('phase3Dashboard', '定制看板');
+    const body = await parseJson(c, S.isCreateDashboardRequest, 'dashboard');
+    return ok(c, { dashboard: await dashboards.create(body) }, 201);
+  });
+
+  app.get('/dashboards', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { dashboards: await dashboards.listDashboards(workspaceId) });
+  });
+
+  app.get('/dashboards/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const board = await dashboards.getDashboard(workspaceId, c.req.param('id'));
+    const cache = await dashboards.cachedWidgetData(workspaceId, c.req.param('id'));
+    return ok(c, { ...board, data: cache });
+  });
+
+  app.patch('/dashboards/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = (await c.req.json().catch(() => ({}))) as { name?: string };
+    if (!body.name) throw AppError.badRequest('缺少 name');
+    return ok(c, { dashboard: await dashboards.renameDashboard(workspaceId, c.req.param('id'), body.name) });
+  });
+
+  app.delete('/dashboards/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const confirm = c.req.query('confirm') === 'true';
+    gate('dashboard.delete', confirm, { dashboardId: c.req.param('id') });
+    return ok(c, await dashboards.deleteDashboard(workspaceId, c.req.param('id')));
+  });
+
+  app.post('/dashboards/:id/layout', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = await parseJson(c, S.isSaveLayoutRequest, 'layout');
+    const result = await dashboards.saveLayout({ workspaceId, dashboardId: c.req.param('id'), items: body.items, compact: body.compact });
+    return ok(c, { dashboard: result.dashboard, widgets: result.widgets });
+  });
+
+  app.post('/dashboards/:id/layout/rollback', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = (await c.req.json().catch(() => ({}))) as { index?: number };
+    return ok(c, await dashboards.rollbackLayout(workspaceId, c.req.param('id'), body.index));
+  });
+
+  app.post('/dashboards/:id/refresh', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await dashboards.refreshDashboard({ workspaceId, dashboardId: c.req.param('id') }));
+  });
+
+  app.post('/dashboards/:id/widgets', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!S.isCreateWidgetRequestV3({ ...body, workspaceId, dashboardId: c.req.param('id') })) {
+      throw AppError.badRequest('请求体字段缺失或类型错误（widget）');
+    }
+    const input = { ...body, workspaceId, dashboardId: c.req.param('id') } as Parameters<typeof dashboards.createWidget>[0];
+    if (typeof body.naturalLanguage === 'string' && !body.type) {
+      const nl = await dashboards.createFromNaturalLanguage({ workspaceId, naturalLanguage: body.naturalLanguage, dashboardId: c.req.param('id') });
+      return ok(c, nl, 201);
+    }
+    return ok(c, { widget: await dashboards.createWidget(input) }, 201);
+  });
+
+  app.get('/widgets', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    if (c.req.query('pinned') === 'true') return ok(c, { widgets: await dashboards.listPinned(workspaceId) });
+    const dashboardId = c.req.query('dashboardId');
+    if (!dashboardId) throw AppError.badRequest('缺少 dashboardId');
+    return ok(c, await dashboards.getDashboard(workspaceId, dashboardId));
+  });
+
+  app.patch('/widgets/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = await parseJson(c, S.isUpdateWidgetRequest, 'widget');
+    return ok(c, { widget: await dashboards.updateWidget({ workspaceId, widgetId: c.req.param('id'), ...body }) });
+  });
+
+  app.delete('/widgets/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    await dashboards.removeWidget(workspaceId, c.req.param('id'));
+    return ok(c, { removed: true });
+  });
+
+  app.post('/widgets/:id/refresh', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await dashboards.refreshWidget({ workspaceId, widgetId: c.req.param('id') }));
+  });
+
+  app.post('/widgets/:id/pin', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = (await c.req.json().catch(() => ({}))) as { pinned?: boolean };
+    if (typeof body.pinned !== 'boolean') throw AppError.badRequest('缺少 pinned（布尔值）');
+    return ok(c, { widget: await dashboards.setPinned(workspaceId, c.req.param('id'), body.pinned) });
+  });
+
+  /* --------------------------- 定时任务 --------------------------- */
+  app.get('/schedule/templates', (c) => ok(c, { templates: scheduleManagerV3.templates(), presets: scheduleManagerV3.cronPresets() }));
+
+  app.post('/schedule/preview', async (c) => {
+    const body = await parseJson(c, S.isCronPreviewRequest, 'cron');
+    return ok(c, scheduleManagerV3.previewCron(body.expression, body.timezone ?? 'Asia/Shanghai'));
+  });
+
+  app.post('/schedules', async (c) => {
+    requireFeature('phase3Schedule', '定时任务');
+    const body = await parseJson(c, S.isCreateScheduleRequestV3, 'schedule');
+    const task = await scheduleManagerV3.create(body as Parameters<typeof schedules.create>[0]);
+    return ok(c, { schedule: task }, 201);
+  });
+
+  app.get('/schedules', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { schedules: await scheduleManagerV3.list(workspaceId) });
+  });
+
+  app.get('/schedules/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const task = await scheduleManagerV3.get(workspaceId, c.req.param('id'));
+    const runs = await scheduleManagerV3.listRuns(workspaceId, c.req.param('id'));
+    return ok(c, { schedule: task, runs, stats: computeStats(runs), timeline: buildTimeline(runs) });
+  });
+
+  app.patch('/schedules/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = await parseJson(c, S.isUpdateScheduleRequest, 'schedule');
+    return ok(c, { schedule: await scheduleManagerV3.update({ workspaceId, id: c.req.param('id'), ...body }) });
+  });
+
+  app.delete('/schedules/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const confirm = c.req.query('confirm') === 'true';
+    gate('schedule.delete', confirm, { scheduleId: c.req.param('id') });
+    return ok(c, await scheduleManagerV3.remove({ workspaceId, id: c.req.param('id'), confirm }));
+  });
+
+  app.post('/schedules/:id/run', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = (await c.req.json().catch(() => ({}))) as { confirm?: boolean };
+    if (body.confirm !== true) throw AppError.confirmRequired('手动触发定时任务会立即执行真实动作，需要二次确认');
+    return ok(c, { run: await scheduleManagerV3.runNow({ workspaceId, id: c.req.param('id'), confirm: true }) }, 202);
+  });
+
+  app.get('/schedules/:id/runs', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const runs = await scheduleManagerV3.listRuns(workspaceId, c.req.param('id'), Number(c.req.query('limit') ?? 50));
+    return ok(c, { runs, stats: computeStats(runs), timeline: buildTimeline(runs) });
+  });
+
+  app.get('/schedule-audits', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { audits: await auditorSchedule.list(workspaceId, Number(c.req.query('limit') ?? 100)) });
+  });
+
+  /* --------------------------- 通知设置 --------------------------- */
+  app.get('/notify/catalog', (c) => ok(c, { channels: notify.catalog() }));
+
+  app.post('/notify/channels', async (c) => {
+    requireFeature('phase3Notify', '推送通知');
+    const body = await parseJson(c, S.isCreateNotifyChannelRequest, 'channel');
+    const channel = await notify.createChannel(body as Parameters<typeof notify.createChannel>[0]);
+    return ok(c, { channel }, 201);
+  });
+
+  app.get('/notify/channels', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { channels: await notify.listChannels(workspaceId) });
+  });
+
+  app.patch('/notify/channels/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = await parseJson(c, S.isUpdateNotifyChannelRequest, 'channel');
+    return ok(c, { channel: await notify.updateChannel({ workspaceId, channelId: c.req.param('id'), ...body }) });
+  });
+
+  app.delete('/notify/channels/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const confirm = c.req.query('confirm') === 'true';
+    gate('notify.delete', confirm, { channelId: c.req.param('id') });
+    await notify.removeChannel(workspaceId, c.req.param('id'));
+    return ok(c, { removed: true });
+  });
+
+  app.post('/notify/test', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const body = await parseJson(c, S.isTestNotifyRequest, 'test');
+    return ok(c, await notify.testChannel({ workspaceId, channelId: body.channelId }));
+  });
+
+  app.post('/notify/send', async (c) => {
+    const body = await parseJson(c, S.isSendNotifyRequest, 'send');
+    return ok(c, await notify.dispatch({ workspaceId: body.workspaceId, channelIds: body.channelIds, message: body.message as never }));
+  });
+
+  app.get('/notify/logs', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { logs: await notify.listLogs(workspaceId, Number(c.req.query('limit') ?? 100), c.req.query('channelId') || undefined) });
+  });
 
   /* ---------------------------- 错误兜底 ---------------------------- */
   app.notFound((c) => fail(c, AppError.notFound(`接口不存在: ${c.req.method} ${c.req.path}`)));

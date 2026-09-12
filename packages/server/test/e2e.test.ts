@@ -222,12 +222,16 @@ test('危险操作缺少用户确认时被拒绝', async () => {
   assert.equal(body.error.code, 'BAD_REQUEST');
 });
 
-test('Phase 3 未交付能力返回明确说明而非静默失败', async () => {
+test('Phase 3 部署入口已交付：旧占位接口明确告知迁移路径（不再假装成功）', async () => {
+  // 旧版 /website/deploy 返回 202 accepted:true 但什么都没做 —— 用户会误以为部署成功。
+  // Phase 3 真实入口是 /websites → /generate → /deploy，这里必须明确重定向而不是静默假成功。
   const res = await post('/website/deploy', { workspaceId: boot.workspace.id, description: 'x', confirm: true });
   const body = await res.json();
   assert.equal(res.status, 400);
   assert.equal(body.ok, false);
-  assert.ok(body.error.message.includes('Phase 3'), '未交付能力必须给出明确说明');
+  assert.match(body.error.message, /已迁移/);
+  assert.ok(Array.isArray(body.error.details?.replacements), '应给出替代接口列表');
+  assert.ok(body.error.details.replacements.includes('POST /websites/:id/deploy'));
 });
 
 test('工具注册表包含 Phase 1 必备工具', async () => {

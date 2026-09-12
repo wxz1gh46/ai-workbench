@@ -4,6 +4,9 @@ import {
   Boxes,
   Brain,
   CalendarClock,
+  Cloud,
+  Database,
+  BellRing,
   FileSpreadsheet,
   FileText,
   LayoutDashboard,
@@ -30,8 +33,18 @@ import { SettingsPage } from '@/pages/SettingsPage';
 import { MemoryPanelPage } from '@/pages/MemoryPanelPage';
 import { OfficeWorkspacePage } from '@/pages/OfficeWorkspacePage';
 import { ResearchPage } from '@/pages/ResearchPage';
+import { DeployCenterPage } from '@/pages/DeployCenterPage';
+import { DatabasePanelPage } from '@/pages/DatabasePanelPage';
+import { DashboardEditorPage } from '@/pages/DashboardEditorPage';
+import { ScheduleManagerPage } from '@/pages/ScheduleManagerPage';
+import { NotificationSettingsPage } from '@/pages/NotificationSettingsPage';
 
 type TabKey =
+  | 'deploy'
+  | 'database'
+  | 'boardEditor'
+  | 'schedules'
+  | 'notify'
   | 'goal'
   | 'chat'
   | 'cluster'
@@ -46,15 +59,20 @@ type TabKey =
   | 'settings';
 
 const TABS: { key: TabKey; label: string; icon: typeof Target; group?: string }[] = [
+  { key: 'deploy', label: '部署中心', icon: Cloud, group: 'Phase 3' },
+  { key: 'database', label: '数据库面板', icon: Database, group: 'Phase 3' },
+  { key: 'boardEditor', label: '看板编辑器', icon: LayoutDashboard, group: 'Phase 3' },
+  { key: 'schedules', label: '定时任务', icon: CalendarClock, group: 'Phase 3' },
+  { key: 'notify', label: '通知设置', icon: BellRing, group: 'Phase 3' },
   { key: 'goal', label: '目标模式', icon: Target, group: 'Phase 2' },
   { key: 'cluster', label: 'Agent 集群', icon: Boxes, group: 'Phase 2' },
   { key: 'office', label: 'Office 工作区', icon: FileSpreadsheet, group: 'Phase 2' },
   { key: 'research', label: '深度研究', icon: Microscope, group: 'Phase 2' },
   { key: 'memory', label: '记忆面板', icon: Brain, group: 'Phase 2' },
   { key: 'chat', label: '对话', icon: MessageSquare },
-  { key: 'dashboard', label: '看板', icon: LayoutDashboard },
+  { key: 'dashboard', label: '看板（简版）', icon: LayoutDashboard },
   { key: 'files', label: '文件', icon: FileText },
-  { key: 'schedule', label: '定时任务', icon: CalendarClock },
+  { key: 'schedule', label: '定时任务（简版）', icon: CalendarClock },
   { key: 'plugins', label: '插件', icon: Puzzle },
   { key: 'prompt', label: '提示词', icon: Terminal },
   { key: 'settings', label: '设置', icon: Settings },
@@ -62,7 +80,7 @@ const TABS: { key: TabKey; label: string; icon: typeof Target; group?: string }[
 
 export default function App() {
   const { ready, error, init, agents, workspace, degraded } = useAppStore();
-  const [tab, setTab] = useState<TabKey>('goal');
+  const [tab, setTab] = useState<TabKey>('deploy');
 
   useEffect(() => {
     void init();
@@ -125,6 +143,11 @@ export default function App() {
       </nav>
 
       <main className="min-h-0 flex-1 overflow-hidden p-3">
+        {tab === 'deploy' && <DeployCenterPage />}
+        {tab === 'database' && <DatabasePanelPage />}
+        {tab === 'boardEditor' && <DashboardEditorPage />}
+        {tab === 'schedules' && <ScheduleManagerPage />}
+        {tab === 'notify' && <NotificationSettingsPage />}
         {tab === 'goal' && <GoalPage />}
         {tab === 'cluster' && <AgentClusterPage />}
         {tab === 'office' && <OfficeWorkspacePage />}

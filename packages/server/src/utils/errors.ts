@@ -26,6 +26,10 @@ export class AppError extends Error {
   static forbidden(message: string) {
     return new AppError(ErrorCode.FORBIDDEN, message, 403);
   }
+  /** 危险操作缺少二次确认：428 让前端明确渲染确认弹窗 */
+  static confirmRequired(message: string, details?: unknown) {
+    return new AppError(ErrorCode.CONFIRM_REQUIRED, message, 428, details);
+  }
   static internal(message: string, details?: unknown) {
     return new AppError(ErrorCode.INTERNAL, message, 500, details);
   }
