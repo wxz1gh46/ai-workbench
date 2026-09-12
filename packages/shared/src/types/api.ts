@@ -212,7 +212,18 @@ import type {
 
 export interface ContextSummaryResponse {
   conversationId: Id;
-  summaries: { id: Id; content: string; tokenCount: number; fromMessageId: Id; toMessageId: Id; createdAt: string }[];
+  summaries: {
+    id: Id;
+    content: string;
+    tokenCount: number;
+    /** 本次摘要覆盖的消息条数 */
+    coveredCount: number;
+    /** rolling 滚动摘要 / manual 手动压缩 */
+    kind: string;
+    fromMessageId: Id;
+    toMessageId: Id;
+    createdAt: string;
+  }[];
   facts: MemoryFactRecord[];
   messages: number;
   /** 未摘要消息的 token 总量 */
@@ -340,8 +351,12 @@ export interface OfficeOperationResponse {
   path: string;
   version: number;
   bytes: number;
+  /** 实际被应用的编辑操作数 */
+  applied: number;
+  /** 编辑前自动备份的版本号（null 表示未备份） */
+  backupVersion: number | null;
   warnings: string[];
-  degraded: boolean;
+  degraded?: boolean;
 }
 
 export interface FileVersionsResponse {

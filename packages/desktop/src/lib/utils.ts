@@ -20,11 +20,18 @@ const TASK_LABELS: Record<Task['status'], string> = {
   cancelled: '已取消',
 };
 
-export function taskStatusLabel(status: Task['status']): string {
-  return TASK_LABELS[status] ?? status;
+/** 兼容任务与目标状态（进度树会混用） */
+export function taskStatusLabel(status: Task['status'] | string): string {
+  const GOAL_LABELS: Record<string, string> = {
+    draft: '草稿',
+    planning: '规划中',
+    auditing: '审计中',
+    completed: '已完成',
+  };
+  return TASK_LABELS[status as Task['status']] ?? GOAL_LABELS[status] ?? status;
 }
 
-export function taskStatusColor(status: Task['status']): string {
+export function taskStatusColor(status: Task['status'] | string): string {
   switch (status) {
     case 'succeeded':
       return 'text-emerald-400';

@@ -231,6 +231,12 @@ export interface AgentMessage {
   toAgentId: Id | null;
   topic: string;
   payload: Record<string, unknown>;
+  /** Phase 2：话题线程，便于 UI 聚合 */
+  threadId?: string;
+  /** Phase 2：消息种类 */
+  kind?: string;
+  /** Phase 2：可读消息正文 */
+  content?: string;
   createdAt: IsoDateTime;
 }
 

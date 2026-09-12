@@ -1,5 +1,19 @@
 import { useEffect, useState } from 'react';
-import { Activity, Boxes, CalendarClock, FileText, LayoutDashboard, MessageSquare, Puzzle, Settings, Terminal, Target } from 'lucide-react';
+import {
+  Activity,
+  Boxes,
+  Brain,
+  CalendarClock,
+  FileSpreadsheet,
+  FileText,
+  LayoutDashboard,
+  MessageSquare,
+  Microscope,
+  Puzzle,
+  Settings,
+  Terminal,
+  Target,
+} from 'lucide-react';
 import { useAppStore } from '@/stores/app-store';
 import { Toasts } from '@/components/Toasts';
 import { Badge } from '@/components/ui';
@@ -11,20 +25,38 @@ import { FilesPage } from '@/pages/FilesPage';
 import { SchedulePage } from '@/pages/SchedulePage';
 import { PluginsPage } from '@/pages/PluginsPage';
 import { PromptPage } from '@/pages/PromptPage';
-import { ClusterPage } from '@/pages/ClusterPage';
+import { AgentClusterPage } from '@/pages/AgentClusterPage';
 import { SettingsPage } from '@/pages/SettingsPage';
+import { MemoryPanelPage } from '@/pages/MemoryPanelPage';
+import { OfficeWorkspacePage } from '@/pages/OfficeWorkspacePage';
+import { ResearchPage } from '@/pages/ResearchPage';
 
-type TabKey = 'goal' | 'chat' | 'dashboard' | 'files' | 'schedule' | 'plugins' | 'prompt' | 'cluster' | 'settings';
+type TabKey =
+  | 'goal'
+  | 'chat'
+  | 'cluster'
+  | 'office'
+  | 'research'
+  | 'memory'
+  | 'dashboard'
+  | 'files'
+  | 'schedule'
+  | 'plugins'
+  | 'prompt'
+  | 'settings';
 
-const TABS: { key: TabKey; label: string; icon: typeof Target }[] = [
-  { key: 'goal', label: '目标模式', icon: Target },
+const TABS: { key: TabKey; label: string; icon: typeof Target; group?: string }[] = [
+  { key: 'goal', label: '目标模式', icon: Target, group: 'Phase 2' },
+  { key: 'cluster', label: 'Agent 集群', icon: Boxes, group: 'Phase 2' },
+  { key: 'office', label: 'Office 工作区', icon: FileSpreadsheet, group: 'Phase 2' },
+  { key: 'research', label: '深度研究', icon: Microscope, group: 'Phase 2' },
+  { key: 'memory', label: '记忆面板', icon: Brain, group: 'Phase 2' },
   { key: 'chat', label: '对话', icon: MessageSquare },
   { key: 'dashboard', label: '看板', icon: LayoutDashboard },
   { key: 'files', label: '文件', icon: FileText },
   { key: 'schedule', label: '定时任务', icon: CalendarClock },
   { key: 'plugins', label: '插件', icon: Puzzle },
   { key: 'prompt', label: '提示词', icon: Terminal },
-  { key: 'cluster', label: '集群', icon: Boxes },
   { key: 'settings', label: '设置', icon: Settings },
 ];
 
@@ -58,10 +90,12 @@ export default function App() {
           <div className="mt-0.5 text-[10px] text-muted">你定义方向，它完成全过程</div>
         </div>
         <ul className="flex-1 overflow-auto p-2">
-          {TABS.map((t) => {
+          {TABS.map((t, idx) => {
             const Icon = t.icon;
+            const showGroup = t.group && (idx === 0 || TABS[idx - 1]?.group !== t.group);
             return (
               <li key={t.key}>
+                {showGroup && <div className="mb-1 mt-2 px-2 text-[9px] uppercase tracking-wide text-muted/70">{t.group}</div>}
                 <button
                   onClick={() => setTab(t.key)}
                   className={cn(
@@ -92,13 +126,16 @@ export default function App() {
 
       <main className="min-h-0 flex-1 overflow-hidden p-3">
         {tab === 'goal' && <GoalPage />}
+        {tab === 'cluster' && <AgentClusterPage />}
+        {tab === 'office' && <OfficeWorkspacePage />}
+        {tab === 'research' && <ResearchPage />}
+        {tab === 'memory' && <MemoryPanelPage />}
         {tab === 'chat' && <ChatPage />}
         {tab === 'dashboard' && <DashboardPage />}
         {tab === 'files' && <FilesPage />}
         {tab === 'schedule' && <SchedulePage />}
         {tab === 'plugins' && <PluginsPage />}
         {tab === 'prompt' && <PromptPage />}
-        {tab === 'cluster' && <ClusterPage />}
         {tab === 'settings' && <SettingsPage />}
       </main>
 

@@ -1,5 +1,22 @@
 import type {
   AdvanceGoalResponse,
+  AuditReport,
+  ClusterConfig,
+  CompactResult,
+  ContextBundle,
+  ContextSummaryResponse,
+  CreateResearchResponse,
+  GoalRun,
+  OfficeDocumentInfo,
+  OfficeOperationResponse,
+  OfficePreview,
+  ProgressTree,
+  ResearchJob,
+  ResearchJobResponse,
+  ResearchReport,
+  RunGoalResponse,
+  TaskBoard,
+  TaskBoardCard,
   Agent,
   Artifact,
   AuditLog,
@@ -97,5 +114,98 @@ export const api = {
     request<{ updated: boolean }>(`/widgets/${id}`, { method: 'PATCH', body: JSON.stringify({ layout }) }),
   removeWidget: (id: string) => request<{ removed: boolean }>(`/widgets/${id}`, { method: 'DELETE' }),
 
+
+  listFiles: (workspaceId: string) =>
+    request<{ files: { id: string; path: string; name: string; ext: string; size: number; version: number; mime: string }[] }>(
+      `/files?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+
   listAudit: (workspaceId: string) => request<{ logs: AuditLog[] }>(`/audit?workspaceId=${encodeURIComponent(workspaceId)}`),
+
+  /* ---------------------- Phase 2：分层上下文 ---------------------- */
+
+  contextSummary: (conversationId: string) => request<ContextSummaryResponse>(`/context/${encodeURIComponent(conversationId)}/summary`),
+  compactContext: (conversationId: string, workspaceId: string, body: { force?: boolean; keepRecent?: number } = {}) =>
+    request<CompactResult>(`/context/${encodeURIComponent(conversationId)}/compact`, {
+      method: 'POST',
+      headers: { 'x-workspace-id': workspaceId },
+      body: JSON.stringify(body),
+    }),
+  contextPreview: (conversationId: string, q: string, files: string[] = []) =>
+    request<ContextBundle>(
+      `/conversations/${encodeURIComponent(conversationId)}/context-preview?q=${encodeURIComponent(q)}${files.length ? `&files=${encodeURIComponent(files.join(','))}` : ''}`,
+    ),
+
+  /* ------------------------ Phase 2：目标模式 ----------------------- */
+
+  createGoalV2: (workspaceId: string, objective: string, autoRun = false, maxIterations?: number) =>
+    request<{ goal: Goal; tasks: Task[] }>('/goals', {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, objective, autoRun, ...(maxIterations === undefined ? {} : { maxIterations }) }),
+    }),
+  getGoalV2: (id: string) => request<{ goal: Goal; tasks: Task[] }>(`/goals/${id}`),
+  runGoalV2: (id: string, mode?: ClusterConfig['mode']) =>
+    request<RunGoalResponse>(`/goals/${id}/run`, { method: 'POST', body: JSON.stringify(mode ? { mode } : {}) }),
+  cancelGoal: (id: string) => request<{ goal: Goal }>(`/goals/${id}/cancel`, { method: 'POST', body: '{}' }),
+  goalProgress: (id: string) => request<ProgressTree>(`/goals/${id}/progress`),
+  goalAudit: (id: string) => request<{ audit: AuditReport | null; markdown: string | null }>(`/goals/${id}/audit`),
+  goalRuns: (id: string) => request<{ runs: GoalRun[] }>(`/goals/${id}/runs`),
+  goalBoard: (id: string) => request<{ board: TaskBoard }>(`/goals/${id}/board`),
+  goalMessages: (id: string) => request<{ messages: { id: string; kind: string; content: string; fromAgentId: string; createdAt: string }[] }>(`/goals/${id}/messages`),
+  assignTask: (taskId: string, agentId: string, preempt = false) =>
+    request<{ task: Task }>(`/tasks/${taskId}/assign`, { method: 'POST', body: JSON.stringify({ agentId, preempt }) }),
+  sendAgentMessage: (agentId: string, goalId: string, content: string, kind = 'direct') =>
+    request<{ message: { id: string } }>(`/agents/${agentId}/message`, { method: 'POST', body: JSON.stringify({ goalId, content, kind }) }),
+
+  /* ------------------------ Phase 2：集群配置 ----------------------- */
+
+  getCluster: (workspaceId: string) => request<{ config: ClusterConfig }>(`/cluster?workspaceId=${encodeURIComponent(workspaceId)}`),
+  setCluster: (workspaceId: string, patch: { mode?: ClusterConfig['mode']; maxParallel?: number; experimental?: boolean }) =>
+    request<{ config: ClusterConfig }>('/cluster', { method: 'PATCH', body: JSON.stringify({ workspaceId, ...patch }) }),
+  listAgentsV2: (workspaceId: string) => request<{ agents: Agent[] }>(`/agents?workspaceId=${encodeURIComponent(workspaceId)}`),
+  agentRuns: (agentId: string, limit = 50) => request<{ runs: unknown[] }>(`/agents/${agentId}/runs?limit=${limit}`),
+
+  /* ------------------------- Phase 2：Office ------------------------ */
+
+  officeStatus: () => request<{ available: boolean; hint: string }>('/office/status'),
+  officeRead: (workspaceId: string, path: string) =>
+    request<OfficeDocumentInfo & { warnings: string[]; truncated: boolean }>('/office/read', { method: 'POST', body: JSON.stringify({ workspaceId, path }) }),
+  officePreview: (workspaceId: string, path: string) =>
+    request<OfficePreview>('/office/preview', { method: 'POST', body: JSON.stringify({ workspaceId, path }) }),
+  officeEdit: (workspaceId: string, path: string, operations: unknown[], backup = true) =>
+    request<OfficeOperationResponse>('/office/edit', { method: 'POST', body: JSON.stringify({ workspaceId, path, operations, backup }) }),
+  officeConvert: (workspaceId: string, path: string, target: string, outputPath?: string) =>
+    request<{ path: string; degraded: boolean; warnings: string[]; version: number }>('/office/convert', {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, path, target, ...(outputPath ? { outputPath } : {}) }),
+    }),
+  officeExport: (workspaceId: string, path: string, ttlHours = 168) =>
+    request<{ id: string; url: string | null; size: number; expiresAt: string | null }>('/office/export', {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, path, ttlHours }),
+    }),
+  fileVersions: (fileId: string) =>
+    request<{ fileId: string; current: number; path: string; versions: { id: string; version: number; size: number; note: string; createdAt: string }[] }>(
+      `/files/${encodeURIComponent(fileId)}/versions`,
+    ),
+  restoreFile: (fileId: string, version: number) =>
+    request<{ fileId: string; version: number; restoredFrom: number; restoredToWorkspace: boolean }>(`/files/${encodeURIComponent(fileId)}/restore`, {
+      method: 'POST',
+      body: JSON.stringify({ version }),
+    }),
+
+  /* ------------------------ Phase 2：深度研究 ----------------------- */
+
+  researchCapability: () => request<{ network: boolean; hint: string; maxSources: number }>('/research/capability'),
+  listResearch: (workspaceId: string) => request<{ jobs: ResearchJob[] }>(`/research?workspaceId=${encodeURIComponent(workspaceId)}`),
+  createResearch: (input: { workspaceId: string; topic: string; depth?: string; allowNetwork?: boolean; outputFormats?: string[]; maxSources?: number }) =>
+    request<CreateResearchResponse>('/research', { method: 'POST', body: JSON.stringify(input) }),
+  getResearch: (id: string) => request<ResearchJobResponse>(`/research/${id}`),
+  getResearchReport: (id: string) => request<{ job: ResearchJob; report: ResearchReport }>(`/research/${id}/report`),
+  publishResearch: (id: string, isPublic = false) =>
+    request<{ webUrl: string; reportId: string }>(`/research/${id}/publish`, { method: 'POST', body: JSON.stringify({ public: isPublic }) }),
+  cancelResearch: (id: string) => request<{ job: ResearchJob }>(`/research/${id}/cancel`, { method: 'POST', body: '{}' }),
+  researchExportUrl: (id: string) => `${BASE}/research/${encodeURIComponent(id)}/export`,
 };
+
+export type { TaskBoardCard };
