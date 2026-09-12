@@ -296,3 +296,144 @@ test('Phase 2 迁移回滚脚本存在且 0002 标记为已应用', async () => 
   const res = await post('/research', { workspaceId: boot.workspace.id, topic: '迁移校验' });
   assert.ok([201, 400, 403].includes(res.status), `Phase 2 表应可访问，实际 ${res.status}`);
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 2 Step 2/3/4：目标引擎 / 进度树 / 审计 / 集群 / 任务板          */
+/* ------------------------------------------------------------------ */
+
+let phase2GoalId = '';
+
+test('Phase 2 POST /goals 创建目标并生成 ≥10 步任务 DAG', async () => {
+  const res = await post('/goals', {
+    workspaceId: boot.workspace.id,
+    objective: '为储能行业产出一份带数据与风险评估的调研报告',
+  });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.ok(body.data.goal.acceptanceCriteria.length >= 1);
+  assert.ok(body.data.tasks.length >= 10, `应拆解出 ≥10 个任务，实际 ${body.data.tasks.length}`);
+  phase2GoalId = body.data.goal.id;
+});
+
+test('Phase 2 POST /goals/:id/run 自主推进到完成并产出审计', async () => {
+  const res = await post(`/goals/${phase2GoalId}/run`, {});
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.finished, true, `应自主完成，实际 ${body.data.goal.status}`);
+  assert.equal(body.data.goal.status, 'completed');
+  assert.equal(body.data.goal.progress, 100);
+  assert.ok(body.data.audit, '必须返回结构化审计报告');
+  assert.equal(body.data.audit.passed, true);
+  assert.ok(body.data.audit.criteria.length > 0);
+  assert.ok(body.data.audit.markdown.includes('验收标准逐条核对'));
+});
+
+test('Phase 2 GET /goals/:id/progress 返回进度树与完成度', async () => {
+  const res = await get(`/goals/${phase2GoalId}/progress`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.goal.id, phase2GoalId);
+  assert.ok(body.data.nodes.length >= 10);
+  assert.equal(body.data.summary.percent, 100);
+  assert.equal(body.data.summary.failed, 0);
+  assert.ok(Array.isArray(body.data.blockers));
+});
+
+test('Phase 2 GET /goals/:id/audit 返回审计报告与 Markdown', async () => {
+  const res = await get(`/goals/${phase2GoalId}/audit`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(body.data.audit);
+  assert.ok(body.data.markdown.includes('## 完成审计报告') || body.data.markdown.includes('# 完成审计报告'));
+});
+
+test('Phase 2 GET /goals/:id/runs 每轮推进可回放', async () => {
+  const res = await get(`/goals/${phase2GoalId}/runs`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(body.data.runs.length >= 2);
+  assert.ok(body.data.runs.every((r: { iteration: number }) => r.iteration > 0));
+});
+
+test('Phase 2 GET /goals/:id/board 任务看板按列聚合', async () => {
+  const res = await get(`/goals/${phase2GoalId}/board`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(body.data.board.total >= 10);
+  assert.ok(body.data.board.columns.done.length >= 10, '全部任务应出现在 done 列');
+});
+
+test('Phase 2 集群配置可切换并可降级为单 Agent', async () => {
+  const patch = await app.fetch(
+    new Request('http://test/cluster', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: boot.workspace.id, mode: 'single', maxParallel: 1, experimental: true }),
+    }),
+  );
+  const body = await patch.json();
+  assert.equal(patch.status, 200);
+  assert.equal(body.data.config.mode, 'single');
+  assert.equal(body.data.config.experimental, true);
+
+  const read = await get(`/cluster?workspaceId=${boot.workspace.id}`);
+  const readBody = await read.json();
+  assert.equal(readBody.data.config.mode, 'single');
+
+  // 恢复 parallel
+  await app.fetch(
+    new Request('http://test/cluster', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: boot.workspace.id, mode: 'parallel', maxParallel: 4 }),
+    }),
+  );
+});
+
+test('Phase 2 非法集群参数返回统一错误格式', async () => {
+  const res = await app.fetch(
+    new Request('http://test/cluster', {
+      method: 'PATCH',
+      headers: { 'content-type': 'application/json' },
+      body: JSON.stringify({ workspaceId: boot.workspace.id, maxParallel: 999 }),
+    }),
+  );
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.error.code, 'BAD_REQUEST');
+});
+
+test('Phase 2 GET /agents 与 /agents/:id/runs 可追踪运行记录', async () => {
+  const list = await get(`/agents?workspaceId=${boot.workspace.id}`);
+  const listBody = await list.json();
+  assert.equal(list.status, 200);
+  assert.ok(listBody.data.agents.length >= 3);
+
+  const agentId = listBody.data.agents[0].id;
+  const runs = await get(`/agents/${agentId}/runs?limit=10`);
+  const runsBody = await runs.json();
+  assert.equal(runs.status, 200);
+  assert.ok(Array.isArray(runsBody.data.runs));
+});
+
+test('Phase 2 Agent 消息总线可发消息并查询', async () => {
+  const list = await get(`/agents?workspaceId=${boot.workspace.id}`);
+  const agentId = (await list.json()).data.agents[0].id;
+  const res = await post(`/agents/${agentId}/message`, { goalId: phase2GoalId, content: '请复核数据来源', kind: 'request-help' });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.ok(body.data.message.id);
+
+  const msgs = await get(`/goals/${phase2GoalId}/messages`);
+  const msgsBody = await msgs.json();
+  assert.ok(msgsBody.data.messages.length > 0);
+});
+
+test('Phase 2 POST /goals/:id/cancel 取消未完成目标', async () => {
+  const created = await post('/goals', { workspaceId: boot.workspace.id, objective: '一个稍后会被取消的目标，需要多步骤完成' });
+  const goalId = (await created.json()).data.goal.id;
+  const res = await post(`/goals/${goalId}/cancel`, {});
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.goal.status, 'cancelled');
+});

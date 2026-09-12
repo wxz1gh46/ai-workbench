@@ -5,6 +5,7 @@ import { EventType, type ApiResponse, type Artifact } from '@ai/shared';
 import { getDb, type Db } from '../db/client.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { GoalService } from '../agent/goal-service.ts';
+import { GoalEngine } from '../goals/goalEngine.ts';
 import { MemoryService } from '../agent/memory.ts';
 import { ContextManager } from '../context/contextManager.ts';
 import { modelRouter } from '../agent/model-router.ts';
@@ -19,6 +20,7 @@ import { WorkspaceService } from '../services/workspace.ts';
 import { officeGenerateTool } from '../tools/office-tools.ts';
 import { registerBuiltinTools } from '../tools/index.ts';
 import { AppError } from '../utils/errors.ts';
+import { logger } from '../utils/logger.ts';
 import { fail, ok, parseJson } from '../utils/http.ts';
 import { newId } from '../utils/ids.ts';
 import { config } from '../config.ts';
@@ -35,6 +37,7 @@ export function createApp(deps: AppDeps = {}) {
   const app = new Hono();
   const workspaceService = new WorkspaceService(db);
   const goalService = new GoalService(db);
+  const goalEngine = new GoalEngine(db);
   const memory = new MemoryService(db);
   const context = new ContextManager(db);
   const files = new FileService(db);
@@ -212,6 +215,132 @@ export function createApp(deps: AppDeps = {}) {
     const id = c.req.param('id');
     const goal = await goalService.getGoal(id);
     return ok(c, { goal, tasks: await goalService.listTasks(id) });
+  });
+
+  /* ------------------ Phase 2：目标模式（GoalEngine） ------------------ */
+
+  /** POST /goals —— 创建目标（Phase 2 主入口） */
+  app.post('/goals', async (c) => {
+    const body = await parseJson(c, S.isCreateGoalRequest, 'goal');
+    const result = await goalEngine.createGoal({
+      workspaceId: body.workspaceId,
+      objective: body.objective,
+      ...(body.acceptanceCriteria ? { acceptanceCriteria: body.acceptanceCriteria } : {}),
+      ...(body.maxIterations !== undefined ? { maxIterations: body.maxIterations } : {}),
+    });
+    if (body.autoRun) {
+      void goalEngine.run(result.goal.id).catch((e) => logger.error('autoRun failed', { goalId: result.goal.id, error: e instanceof Error ? e.message : String(e) }));
+    }
+    return ok(c, result, 201);
+  });
+
+  app.get('/goals', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { goals: await goalService.listGoals(workspaceId) });
+  });
+
+  app.get('/goals/:id', async (c) => {
+    const id = c.req.param('id');
+    return ok(c, { goal: await goalEngine.getGoal(id), tasks: await goalEngine.listTasks(id) });
+  });
+
+  /** POST /goals/:id/run —— 自主推进直到完成 / 达上限 / 停滞 */
+  app.post('/goals/:id/run', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!S.isRunGoalRequest(body)) throw AppError.badRequest('maxIterations 必须是 1~200 的整数，mode 必须是 single|parallel|cluster');
+    const id = c.req.param('id');
+    const result = await goalEngine.run(id, {
+      ...(body.maxIterations !== undefined ? { maxIterations: body.maxIterations as number } : {}),
+      ...(body.mode ? { mode: body.mode as 'single' | 'parallel' | 'cluster' } : {}),
+      userConfirmed: c.req.header('x-user-confirmed') === 'true',
+    });
+    return ok(c, result);
+  });
+
+  app.post('/goals/:id/cancel', async (c) => ok(c, { goal: await goalEngine.cancel(c.req.param('id')) }));
+
+  app.get('/goals/:id/tasks', async (c) => ok(c, { tasks: await goalEngine.listTasks(c.req.param('id')) }));
+
+  /** GET /goals/:id/progress —— 进度树 */
+  app.get('/goals/:id/progress', async (c) => ok(c, await goalEngine.getProgressTree(c.req.param('id'))));
+
+  /** GET /goals/:id/audit —— 完成审计报告 */
+  app.get('/goals/:id/audit', async (c) => {
+    const id = c.req.param('id');
+    const audit = await goalEngine.getAudit(id);
+    return ok(c, { audit, markdown: audit?.markdown ?? null });
+  });
+
+  /** GET /goals/:id/runs —— 每轮推进记录（可回放） */
+  app.get('/goals/:id/runs', async (c) => ok(c, { runs: await goalEngine.listRuns(c.req.param('id')) }));
+
+  /** GET /goals/:id/board —— 任务看板（Step 4） */
+  app.get('/goals/:id/board', async (c) => ok(c, { board: await goalEngine.getTaskBoard(c.req.param('id')) }));
+
+  /** GET /goals/:id/messages —— Agent 消息总线 */
+  app.get('/goals/:id/messages', async (c) => ok(c, { messages: await goalEngine.listAgentMessages(c.req.param('id')) }));
+
+  /** POST /agents/:id/message —— Agent → Agent / Agent → 任务板消息 */
+  app.post('/agents/:id/message', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!S.isSendAgentMessageRequest(body)) throw AppError.badRequest('content 必填且不超过 8000 字');
+    const goalId = String(body.goalId ?? '');
+    if (!goalId) throw AppError.badRequest('缺少 goalId');
+    const message = await goalEngine.sendAgentMessage({
+      goalId,
+      fromAgentId: c.req.param('id'),
+      toAgentId: (body.toAgentId as string | null | undefined) ?? null,
+      kind: typeof body.kind === 'string' ? body.kind : 'direct',
+      content: body.content as string,
+    });
+    return ok(c, { message }, 201);
+  });
+
+  /** POST /tasks/:id/assign —— 指派/抢占 */
+  app.post('/tasks/:id/assign', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!S.isAssignTaskRequest(body)) throw AppError.badRequest('agentId 必填');
+    const task = await goalEngine.assignTask(c.req.param('id'), body.agentId as string, body.preempt === true);
+    return ok(c, { task });
+  });
+
+  /* ------------------- Phase 2：Agent 集群配置 ------------------- */
+
+  app.get('/cluster', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { config: await goalEngine.getClusterConfig(workspaceId) });
+  });
+
+  app.patch('/cluster', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const workspaceId = String(body.workspaceId ?? '');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    if (!S.isClusterConfigRequest(body)) throw AppError.badRequest('mode/maxParallel/experimental 取值非法');
+    const config = await goalEngine.setClusterConfig(workspaceId, {
+      ...(body.mode ? { mode: body.mode as 'single' | 'parallel' | 'cluster' } : {}),
+      ...(body.maxParallel !== undefined ? { maxParallel: body.maxParallel as number } : {}),
+      ...(body.experimental !== undefined ? { experimental: body.experimental as boolean } : {}),
+    });
+    return ok(c, { config });
+  });
+
+  /* ------------------- Phase 2：Agent 运行追踪 ------------------- */
+
+  app.get('/agents', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { agents: await workspaceService.listAgents(workspaceId) });
+  });
+
+  app.get('/agents/:id/runs', async (c) => {
+    const limit = Math.min(Number(c.req.query('limit') ?? 50), 500);
+    const runs = await db.query.agentRuns.findMany({
+      where: (r, { eq }) => eq(r.agentId, c.req.param('id')),
+      limit,
+    });
+    return ok(c, { runs });
   });
 
   app.post('/agent/goals/:id/advance', async (c) => {

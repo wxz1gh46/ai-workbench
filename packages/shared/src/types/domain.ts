@@ -140,6 +140,14 @@ export interface Task {
   input: Record<string, unknown>;
   output: Record<string, unknown> | null;
   error: string | null;
+  /** Phase 2：Critic/Executor 对该任务的反思结论 */
+  reflection?: string;
+  /** Phase 2：产出摘要，供进度树与任务看板展示 */
+  outputSummary?: string | null;
+  /** Phase 2：最近一次执行该任务的 Agent */
+  lastAgentId?: Id | null;
+  /** Phase 2：该任务累计消耗 token */
+  tokensUsed?: number;
   createdAt: IsoDateTime;
   updatedAt: IsoDateTime;
   startedAt: IsoDateTime | null;
