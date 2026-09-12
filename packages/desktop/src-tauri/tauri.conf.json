@@ -1,0 +1,34 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "AI Workbench",
+  "version": "0.1.0",
+  "identifier": "cool.cnb.ai-workbench",
+  "build": {
+    "beforeDevCommand": "pnpm --filter @ai/desktop dev",
+    "devUrl": "http://localhost:5183",
+    "beforeBuildCommand": "pnpm --filter @ai/desktop build",
+    "frontendDist": "../dist"
+  },
+  "app": {
+    "windows": [
+      {
+        "title": "AI 工作台",
+        "width": 1440,
+        "height": 900,
+        "minWidth": 1100,
+        "minHeight": 700,
+        "resizable": true,
+        "fullscreen": false
+      }
+    ],
+    "security": {
+      "csp": "default-src 'self'; connect-src 'self' http://127.0.0.1:8787 ws://127.0.0.1:8787 https: wss:; img-src 'self' data: blob:; style-src 'self' 'unsafe-inline'"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "targets": "all",
+    "icon": ["icons/icon.png"],
+    "resources": []
+  }
+}

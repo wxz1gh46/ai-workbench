@@ -1,0 +1,28 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  --bg: 15 18 25;
+  --panel: 22 26 35;
+  --border: 42 48 62;
+  --fg: 226 232 240;
+  --muted: 148 163 184;
+  --brand: 96 165 250;
+}
+
+html,
+body,
+#root {
+  height: 100%;
+  margin: 0;
+}
+
+::-webkit-scrollbar {
+  width: 8px;
+  height: 8px;
+}
+::-webkit-scrollbar-thumb {
+  background: rgb(var(--border));
+  border-radius: 4px;
+}

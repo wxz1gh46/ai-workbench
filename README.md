@@ -1,0 +1,315 @@
+# AI 工作台（AI Workbench）
+
+> 你定义方向，它完成全过程。你验收结果，它持续进化。
+
+桌面 AI 工作台：给定目标，系统自主规划、多 Agent 并行执行、调用工具、处理文件、部署网站、定时推送，最终交付完整成果。
+
+---
+
+## 目录结构
+
+```
+ai/
+├── packages/
+│   ├── shared/                        # 前后端共享：数据模型 / 事件协议 / API 契约 / 常量
+│   │   └── src/
+│   │       ├── types/
+│   │       │   ├── ids.ts             # Id / 统一错误码 / ApiResponse 包装
+│   │       │   ├── domain.ts          # 18 张表对应的领域模型
+│   │       │   ├── events.ts          # WS 事件协议 + LogLine
+│   │       │   └── api.ts             # 请求/响应 DTO
+│   │       └── constants/index.ts     # Token 预算 / 内置 Agent / 危险动作清单
+│   │
+│   ├── server/                        # Node + TypeScript 后端（Agent Runtime）
+│   │   ├── drizzle.config.ts
+│   │   ├── test/e2e.test.ts           # 端到端冒烟测试（18 用例）
+│   │   └── src/
+│   │       ├── main.ts                # HTTP + WS 启动入口
+│   │       ├── cli.ts                 # 无桌面端也能验证全链路
+│   │       ├── config.ts              # 环境变量读取，无硬编码密钥
+│   │       ├── db/
+│   │       │   ├── client.ts          # SQLite + Drizzle
+│   │       │   ├── migrate.ts         # 自研迁移执行器（幂等 + 可回滚）
+│   │       │   ├── schema/index.ts     # Drizzle schema
+│   │       │   └── migrations/         # 0001_init.sql + .down.sql
+│   │       ├── agent/
+│   │       │   ├── goal-service.ts    # 目标模式编排（Coordinator）
+│   │       │   ├── planner.ts         # 目标解析 → 任务 DAG
+│   │       │   ├── executor.ts        # 任务执行 + 工具调用 + 追踪
+│   │       │   ├── critic.ts          # 完成审计（目标即验收标准）
+│   │       │   ├── task-graph.ts      # DAG 纯函数（ready/blocked/环检测/进度）
+│   │       │   ├── memory.ts          # 分层上下文（摘要/事实/原文/召回）
+│   │       │   ├── model-router.ts    # 多模型路由 + 长上下文自动切换
+│   │       │   └── tokens.ts          # Token 估算
+│   │       ├── tools/                 # 工具层（注册表 + 权限门 + 审计）
+│   │       │   ├── registry.ts
+│   │       │   ├── fs-tools.ts        # 受限文件读写（防路径穿越）
+│   │       │   └── office-tools.ts    # docx/xlsx/pptx/pdf/markdown
+│   │       ├── services/              # 领域服务
+│   │       │   ├── workspace.ts       # 引导 + 内置 Agent
+│   │       │   ├── file-service.ts    # 文件 + 版本历史
+│   │       │   ├── schedule-service.ts + scheduler.ts
+│   │       │   ├── widget-service.ts  # 自然语言 → 小组件
+│   │       │   ├── plugin-service.ts  # 插件市场 + 合规红线
+│   │       │   ├── prompt-service.ts  # 提示词九要素生成
+│   │       │   └── audit.ts
+│   │       ├── events/bus.ts          # 事件总线（环形缓冲回放）
+│   │       ├── events/ws.ts           # WS /events
+│   │       └── router/app.ts + schemas.ts
+│   │
+│   └── desktop/                       # Tauri 2 + React + Vite 桌面端
+│       ├── src/
+│       │   ├── App.tsx                # 左侧导航 + 九大页面
+│       │   ├── stores/app-store.ts    # Zustand 单一状态 + 事件归约
+│       │   ├── lib/api.ts             # 类型安全 API 客户端
+│       │   ├── lib/events.ts          # WS 指数退避重连
+│       │   ├── components/ui.tsx
+│       │   └── pages/                 # 目标/对话/看板/文件/定时/插件/提示词/集群/设置
+│       └── src-tauri/                 # Rust 壳（目录校验 + 通知）
+│
+├── DECISIONS.md                       # 架构决策记录 + 已知缺陷复盘
+├── docs/architecture.md               # 架构图 + 数据流
+├── docker-compose.yml                 # Phase 3 本地 Postgres
+└── .env.example                       # 全部配置项（含密钥占位）
+```
+
+---
+
+## 核心架构
+
+```
+┌─────────────────────────────────────────────────────────────┐
+│ 客户端层  Tauri 2 + React + Zustand + Tailwind              │
+│   目标模式 │ 对话 │ 看板 │ 文件 │ 定时 │ 插件 │ 提示词 │ 集群  │
+└───────────────┬─────────────────────────┬───────────────────┘
+                │ REST /api               │ WS /events
+┌───────────────▼─────────────────────────▼───────────────────┐
+│ Agent 运行时（packages/server/src/agent）                    │
+│                                                             │
+│  Coordinator ──▶ Planner ──▶ TaskQueue(DAG) ──▶ Executor    │
+│       ▲              │              │               │       │
+│       │              ▼              ▼               ▼       │
+│    Critic ◀──── 验收标准        TaskGraph      ToolRegistry  │
+│       │        （目标即审计）    纯函数        + 权限门      │
+│       │                                          │          │
+│       └────────── Memory（分层上下文）            │          │
+│                 摘要/事实/原文/召回                │          │
+└───────────────┬──────────────────────────────┬──────────────┘
+                │                              │
+┌───────────────▼────────────┐   ┌─────────────▼─────────────┐
+│ 模型层  ModelRouter        │   │ 工具层                     │
+│  普通模型 ◀──阈值──▶ 长上下文│   │  fs / office / 插件 / 部署 │
+└────────────────────────────┘   └─────────────┬─────────────┘
+                                               │
+┌──────────────────────────────────────────────▼─────────────┐
+│ 数据层  SQLite + Drizzle（本地） │ Postgres/Neon（Phase 3）  │
+│         向量库（Phase 2）                                   │
+└────────────────────────────────────────────────────────────┘
+```
+
+**目标循环**
+
+```
+解析目标 → 生成计划 → 任务 DAG → 并行执行 → 验证 → 反思 → 更新计划 → 完成审计
+    │                                                        ▲
+    └───────────── 目标文本同时作为起始指令与验收标准 ──────────┘
+```
+
+---
+
+## 快速开始
+
+### 环境要求
+
+- Node.js ≥ 20（开发用 24）
+- pnpm ≥ 9
+- 可选：Rust 1.77+（构建桌面壳）、LibreOffice（Phase 2 文档转换）
+
+### 1. 安装
+
+```bash
+pnpm install
+cp .env.example .env
+```
+
+> `better-sqlite3` 需要编译。Debian/Ubuntu：
+> `apt-get install -y build-essential python3-dev && npm i -g node-gyp`
+
+### 2. 启动后端（终端 1）
+
+```bash
+pnpm dev:server
+# http://127.0.0.1:8787/health
+# ws://127.0.0.1:8787/events
+```
+
+### 3. 启动桌面端（终端 2）
+
+```bash
+pnpm dev:desktop
+# http://localhost:5183
+```
+
+使用 Tauri 原生窗口：
+
+```bash
+pnpm --filter @ai/desktop tauri:dev
+```
+
+### 4. 配置模型（可选但推荐）
+
+不配置也能跑：系统进入**离线兜底模式**，目标是「流程完整、结果占位」，UI 会明确提示。
+
+配置真实模型：
+
+```bash
+# .env
+AI_DEFAULT_PROVIDER=openai-compatible
+AI_BASE_URL=https://api.openai.com/v1   # 或本地 http://127.0.0.1:11434/v1
+AI_API_KEY=sk-***
+AI_MODEL=gpt-4o-mini
+AI_LONG_CONTEXT_MODEL=gpt-4.1
+AI_LONG_CONTEXT_THRESHOLD=120000
+```
+
+### 5. 设置工作目录
+
+桌面端「文件」页右上角填入目录，或在 CLI 中：
+
+```bash
+pnpm cli bootstrap   # 打印 workspace.id
+```
+
+未设置工作目录时，所有文件/Office 工具会被拒绝（安全默认）。
+
+---
+
+## 命令行验证（不依赖桌面端）
+
+```bash
+pnpm cli bootstrap
+pnpm cli goal "调研 2025 年储能行业，输出带引用的报告"
+pnpm cli run <goalId>            # 自动跑完并输出审计报告
+pnpm cli advance <goalId>        # 只推进一轮
+pnpm cli status <goalId>
+pnpm cli office docx --title "周报" --content "# 本周\n- 完成 A"
+```
+
+---
+
+## 测试
+
+```bash
+pnpm test                 # 全部（单元 + 端到端）
+pnpm --filter @ai/server test
+pnpm --filter @ai/desktop test
+pnpm typecheck            # 三个包的类型检查
+```
+
+当前覆盖（49 个用例）：
+
+- **server 单元**：DAG（ready/blocked/环/拓扑/进度）、Token 估算、计划解析、审计解析、工具调用提取、提示词渲染、插件合规、小组件推断
+- **server 端到端**：引导 → 目标模式全流程（含 4 轮推进 + 审计通过）→ Office 四格式落盘 → 文件版本递增 → 插件合规 → 定时任务校验 → 看板 → 提示词 → 审计日志 → 统一错误格式
+- **desktop 单元**：工具函数与状态标签
+
+---
+
+## 接口一览
+
+| 方法 | 路径 | 说明 |
+| --- | --- | --- |
+| GET | `/health` | 健康度 + 降级状态 + 阶段开关 |
+| POST | `/workspaces/bootstrap` | 初始化 local 用户 + 默认工作区 + 9 个内置 Agent |
+| PATCH | `/workspaces/:id` | 设置工作目录 |
+| GET | `/workspaces/:id/agents` | Agent 列表 |
+| POST | `/conversations/:id/messages` | 对话（分层上下文 + 召回溯源） |
+| GET | `/conversations/:id/context-preview` | 查看上下文组装结果与 Token 占用 |
+| GET | `/conversations/:id/memory` | 查看关键事实 |
+| POST | `/agent/goal` | 创建目标（自动拆解 DAG） |
+| POST | `/agent/goals/:id/advance` | 推进一轮 |
+| POST | `/agent/goals/:id/run` | 自动跑完 |
+| GET | `/agent/goals/:id` | 目标 + 任务详情 |
+| GET | `/agent/goals/:id/messages` | Agent 间消息（任务板） |
+| POST | `/agent/tasks/:id/cancel` | 取消任务 |
+| GET | `/agent/runs` | 运行追踪（prompt / 模型 / token） |
+| POST | `/files/upload` | 上传（同路径自动递增版本） |
+| GET | `/files/:id/versions` | 版本历史 |
+| POST | `/office/generate` | 生成 docx/xlsx/pptx/pdf/markdown |
+| POST | `/research` | 深度研究（Phase 2） |
+| POST | `/website/deploy` | 网站部署（Phase 3，需 confirm） |
+| POST/GET/PATCH | `/schedule` | 定时任务 |
+| GET/POST/DELETE | `/plugins` | 插件市场与安装 |
+| POST | `/prompt/optimize` | 提示词九要素生成 |
+| GET/POST/PATCH/DELETE | `/widgets` | 看板小组件 |
+| GET | `/audit` | 审计日志 |
+| GET | `/events/recent` | 事件回放 |
+| WS | `/events` | 实时事件订阅 |
+
+统一响应：成功 `{ ok: true, data, traceId }`；失败 `{ ok: false, error: { code, message, details?, traceId } }`。
+
+---
+
+## 数据模型
+
+18 个实体，全部落地在 SQLite：
+
+`User` `Workspace` `Conversation` `Message` `ConversationSummary` `MemoryFact`
+`Goal` `Task` `Agent` `AgentRun` `ToolCall` `AgentMessage`
+`File` `FileVersion` `Artifact`
+`Website` `DatabaseConnection`
+`Schedule` `ScheduleRun`
+`Widget`
+`Plugin` `PluginCallLog`
+`PromptTemplate`
+`AuditLog` `NotificationChannel`
+
+关键设计：
+
+- **多工作区**：所有业务表带 `workspace_id`，级联删除
+- **任务依赖**：`tasks.depends_on` 存 JSON 数组，运行时校验无环
+- **运行追踪**：`agent_runs` 记录 prompt 摘要、模型、输入/输出 token、成本
+- **文件版本**：`files.version` + `file_versions` 保留每次内容快照
+- **部署记录**：`websites.build_log` + 状态机，支持回滚入口
+- **审计**：`audit_logs.dangerous` / `confirmed_by_user` 双列留痕
+
+---
+
+## 合规与安全约定
+
+**写进代码的硬约束**（有单测覆盖）：
+
+1. 密钥只从环境变量 / Keychain 读取，代码与数据库不存明文
+2. 付费数据源插件（同花顺 / 天眼查 / Wind / 恒生聚源 / S&P Global / IMF / 华宇元典 / 学术库）必须 `requiresUserAuth = true`，凭据由用户手动配置
+3. 插件 manifest 中出现「绕过反爬 / 绕过验证码 / 共享账号 / 破解授权」直接拒绝安装
+4. 文件工具限定在 `workspace.rootPath` 内，拒绝路径穿越
+5. 危险操作（部署 / 删除 / 安装 / 付费调用）在工具层与路由层双重拦截，且必须留审计
+
+---
+
+## 阶段进度
+
+| 阶段 | 内容 | 状态 |
+| --- | --- | --- |
+| **Phase 1 MVP** | 桌面壳 · 聊天 · 模型接入 · SQLite · 文件上传 · 基础 Agent · 基础设置 | ✅ 已交付 |
+| **Phase 2 核心能力** | 目标模式 · 多 Agent 并行 · Office 处理 · 深度研究 · 百万 Token 上下文 | 🟡 目标模式/多 Agent/Office/分层上下文已完成；深度研究联网检索待做 |
+| **Phase 3 交付与自动化** | 网站部署 · Neon/Supabase · 定制看板 · 定时任务 · 推送通知 | 🟡 看板/定时任务已完成；部署与推送待做 |
+| **Phase 4 生态与集群** | 实验性集群 · 精选插件 · 付费数据库 · 提示词工程 · 企业安全审计 | 🟡 插件市场/提示词/审计已完成；跨机集群与真实数据源对接待做 |
+
+---
+
+## 回滚方案
+
+- **代码**：每一阶段独立 PR，`git revert <merge-commit>` 即可回滚
+- **数据库**：`packages/server/src/db/migrations/0001_init.down.sql` 提供完整反向脚本
+- **数据本身**：删除 `data/` 目录即可回到初始状态（本地单机，无外部依赖）
+- **配置**：`.env` 不纳入版本控制，回滚代码不影响用户配置
+
+---
+
+## 下一步建议
+
+1. **Phase 2 收尾**：接入 LanceDB 做真语义召回；用 LLM 自动触发滚动摘要
+2. **Phase 2 收尾**：LibreOffice headless 转换解决 CJK PDF 排版
+3. **Phase 3**：实现 Vercel / Cloudflare Pages Provider 适配器与 Neon 编排
+4. **Phase 3**：推送渠道（桌面通知 / 邮件 / Webhook / 飞书 / 钉钉 / 企业微信）
+5. **Phase 4**：跨机集群调度（BullMQ + Redis）、MCP 插件宿主进程隔离

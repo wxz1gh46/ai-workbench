@@ -1,0 +1,26 @@
+-- 回滚 Phase 1
+DROP TABLE IF EXISTS notification_channels;
+DROP TABLE IF EXISTS audit_logs;
+DROP TABLE IF EXISTS prompt_templates;
+DROP TABLE IF EXISTS plugin_call_logs;
+DROP TABLE IF EXISTS plugins;
+DROP TABLE IF EXISTS widgets;
+DROP TABLE IF EXISTS schedule_runs;
+DROP TABLE IF EXISTS schedules;
+DROP TABLE IF EXISTS database_connections;
+DROP TABLE IF EXISTS websites;
+DROP TABLE IF EXISTS artifacts;
+DROP TABLE IF EXISTS file_versions;
+DROP TABLE IF EXISTS files;
+DROP TABLE IF EXISTS agent_messages;
+DROP TABLE IF EXISTS tool_calls;
+DROP TABLE IF EXISTS agent_runs;
+DROP TABLE IF EXISTS agents;
+DROP TABLE IF EXISTS tasks;
+DROP TABLE IF EXISTS goals;
+DROP TABLE IF EXISTS memory_facts;
+DROP TABLE IF EXISTS conversation_summaries;
+DROP TABLE IF EXISTS messages;
+DROP TABLE IF EXISTS conversations;
+DROP TABLE IF EXISTS workspaces;
+DROP TABLE IF EXISTS users;
