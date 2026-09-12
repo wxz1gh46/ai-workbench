@@ -1,0 +1,10 @@
+$:
+  issue.comment@npc:
+    - name: npc
+      runner:
+        cpus: 2                  # CPU 核数，内存 = CPU x 2G，即 2 核 4G
+      docker:
+        image: node:20
+      stages:
+        - name: npc
+          script: echo runner 2cpu 4G
