@@ -1,0 +1,79 @@
+name: 🐛 缺陷报告
+description: 报告一个可复现的缺陷
+title: "[Bug] "
+labels: ["bug", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        感谢反馈！请尽量填写完整，信息越全定位越快。
+        ⚠️ 请勿粘贴任何真实密钥、Token、数据库连接串或隐私数据。
+
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: 现象描述
+      description: 发生了什么？你期望发生什么？
+      placeholder: 实际行为 vs 期望行为
+    validations:
+      required: true
+
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: 复现步骤
+      description: 最小可复现步骤
+      placeholder: |
+        1. 启动 pnpm dev:server
+        2. 打开桌面端「目标模式」
+        3. 输入「...」
+        4. 观察到 ...
+    validations:
+      required: true
+
+  - type: dropdown
+    id: phase
+    attributes:
+      label: 涉及阶段
+      options:
+        - Phase 1（桌面壳 / 聊天 / 模型 / SQLite）
+        - Phase 2（上下文 / 目标模式 / Office / 研究）
+        - Phase 3（部署 / 数据库 / 看板 / 定时 / 推送）
+        - Phase 4（集群 / 插件 / 付费数据 / 提示词 / 安全）
+        - 构建与工具链
+        - 文档
+    validations:
+      required: true
+
+  - type: textarea
+    id: environment
+    attributes:
+      label: 运行环境
+      placeholder: |
+        - OS: macOS 15 / Ubuntu 24.04 / Windows 11
+        - Node: 20.x / 24.x
+        - pnpm: 9.12.0
+        - 是否配置了模型密钥: 否（离线兜底模式）
+    validations:
+      required: true
+
+  - type: textarea
+    id: logs
+    attributes:
+      label: 日志或截图
+      description: 请先做脱敏处理
+      render: shell
+    validations:
+      required: false
+
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: 提交前确认
+      options:
+        - label: 我已搜索过现有 Issue，确认不是重复问题
+          required: true
+        - label: 我已移除日志中的密钥、Token 与隐私数据
+          required: true
+        - label: 我已阅读 CONTRIBUTING.md
+          required: true

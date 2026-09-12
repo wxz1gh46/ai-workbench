@@ -1,0 +1,123 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  workflow_dispatch:
+
+# 同一分支的重复推送只保留最新一次运行
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+jobs:
+  verify:
+    name: typecheck / test / build
+    runs-on: ubuntu-latest
+    timeout-minutes: 25
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup pnpm
+        uses: pnpm/action-setup@v4
+        with:
+          version: 9.12.0
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: pnpm
+
+      # better-sqlite3 需要原生编译
+      - name: Install native build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y build-essential python3-dev
+
+      - name: Install dependencies
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck
+        run: pnpm typecheck
+
+      - name: Test
+        run: pnpm test
+
+      - name: Build
+        run: pnpm build
+
+  commitlint:
+    name: commit message
+    runs-on: ubuntu-latest
+    if: github.event_name == 'pull_request'
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Validate PR commits follow Conventional Commits
+        run: |
+          pattern='^(feat|fix|docs|test|refactor|perf|build|ci|chore|revert)(\([a-z0-9._/-]+\))?!?: .{1,}'
+          base="${{ github.event.pull_request.base.sha }}"
+          head="${{ github.event.pull_request.head.sha }}"
+          fail=0
+          # 跳过合并提交（Merge/Revert 由 Git 自动生成，不符合本规范）
+          while IFS= read -r subject; do
+            [ -z "$subject" ] && continue
+            printf '%s' "$subject" | grep -qE '^(Merge |Revert ")' && continue
+            if printf '%s' "$subject" | grep -qE "$pattern"; then
+              echo "✅ $subject"
+            else
+              echo "::error::不符合 Conventional Commits: $subject"
+              fail=1
+            fi
+          done < <(git log --format=%s "$base..$head")
+          exit $fail
+
+  secret-scan:
+    name: secret scan
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      # 防止凭据被误提交：命中常见凭据形态直接失败。
+      # 注意排除测试夹具与文档——它们会故意写假凭据来验证扫描器本身。
+      - name: Scan for hardcoded credentials
+        run: |
+          patterns='(sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)'
+          hits="$(grep -rEIln "$patterns" . \
+            --exclude-dir=node_modules \
+            --exclude-dir=.git \
+            --exclude-dir=dist \
+            --exclude-dir=target \
+            --exclude='*.test.ts' \
+            --exclude='*.test.tsx' \
+            --exclude='DECISIONS.md' \
+            --exclude='CHANGELOG.md' \
+            --exclude='SECURITY.md' \
+            --exclude='CONTRIBUTING.md' \
+            || true)"
+          if [ -n "$hits" ]; then
+            echo "::error::发现疑似硬编码凭据，请移除后重试"
+            echo "$hits"
+            exit 1
+          fi
+          echo "✅ 未发现疑似凭据（已排除测试夹具与文档）"
+
+      - name: Reject committed .env files
+        run: |
+          if git ls-files --error-unmatch .env >/dev/null 2>&1; then
+            echo "::error::.env 不应被提交（请只保留 .env.example）"
+            exit 1
+          fi
+          echo "✅ 未提交 .env"
