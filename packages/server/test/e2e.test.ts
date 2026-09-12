@@ -236,3 +236,63 @@ test('工具注册表包含 Phase 1 必备工具', async () => {
     assert.ok(names.includes(n), `缺少工具 ${n}`);
   }
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 2 Step 1：分层上下文接口                                       */
+/* ------------------------------------------------------------------ */
+
+const contextConversationId = 'conv-phase2-context';
+
+test('Phase 2 /context/:id/summary 返回摘要/事实/预算与压缩建议', async () => {
+  const res = await get(`/context/${contextConversationId}/summary`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.conversationId, contextConversationId);
+  assert.ok(Array.isArray(body.data.summaries));
+  assert.ok(Array.isArray(body.data.facts));
+  assert.ok(body.data.budget.total > 0);
+  assert.equal(typeof body.data.shouldCompact, 'boolean');
+  assert.ok(body.data.compactThreshold > 0);
+});
+
+test('Phase 2 /context/:id/compact 无消息时幂等返回 0 条', async () => {
+  const res = await post(`/context/${contextConversationId}/compact`, { force: true });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.summarizedMessages, 0);
+});
+
+test('Phase 2 /context/:id/compact 参数校验与错误格式统一', async () => {
+  const res = await post(`/context/${contextConversationId}/compact`, { keepRecent: -5 });
+  const body = await res.json();
+  assert.equal(res.status, 400);
+  assert.equal(body.ok, false);
+  assert.equal(body.error.code, 'BAD_REQUEST');
+  assert.ok(body.error.traceId);
+});
+
+test('Phase 2 /conversations/:id/context-preview 返回分层块与溯源', async () => {
+  const res = await get(`/conversations/${contextConversationId}/context-preview?q=测试`);
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(Array.isArray(body.data.blocks));
+  assert.ok(body.data.budget.limits.recent > 0);
+  assert.equal(typeof body.data.routedByLength, 'boolean');
+  assert.ok(body.data.model.length > 0);
+});
+
+test('Phase 2 迁移回滚脚本存在且 0002 标记为已应用', async () => {
+  const { readdirSync } = await import('node:fs');
+  const pathMod = await import('node:path');
+  const migDir = pathMod.resolve(import.meta.dirname, '../src/db/migrations');
+  const files = readdirSync(migDir);
+  // 每个向上迁移都必须有对应的 down 脚本（「每个阶段可独立回滚」的硬要求）
+  const ups = files.filter((f) => f.endsWith('.sql') && !f.endsWith('.down.sql'));
+  for (const up of ups) {
+    assert.ok(files.includes(up.replace(/\.sql$/, '.down.sql')), `迁移 ${up} 缺少 down 脚本`);
+  }
+  assert.ok(ups.includes('0002_phase2.sql'), 'Phase 2 迁移应存在');
+  // 0002 已应用 → Phase 2 表可用
+  const res = await post('/research', { workspaceId: boot.workspace.id, topic: '迁移校验' });
+  assert.ok([201, 400, 403].includes(res.status), `Phase 2 表应可访问，实际 ${res.status}`);
+});

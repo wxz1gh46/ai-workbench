@@ -382,6 +382,9 @@ export class ContextManager {
         .limit(1)
     )[0];
 
+    // 工作区必须先解析成功：会话不存在时给出 404，而不是在写入过程中抛出 500
+    const workspaceId = opts.workspaceId ?? (await this.resolveWorkspaceId(conversationId));
+
     const result = await summarize({
       messages: toSummarize,
       ...(lastSummary ? { previousSummary: lastSummary.content } : {}),
@@ -412,7 +415,6 @@ export class ContextManager {
     const modelFacts = result.degraded ? [] : await extractFactsByModel(toSummarize.map((m) => m.content).join('\n').slice(0, 12_000));
     const merged = mergeFacts(ruleFacts, modelFacts, toSummarize[toSummarize.length - 1]!.id);
 
-    const workspaceId = opts.workspaceId ?? (await this.resolveWorkspaceId(conversationId));
     let factsExtracted = 0;
     for (const f of merged) {
       const exists = await this.db

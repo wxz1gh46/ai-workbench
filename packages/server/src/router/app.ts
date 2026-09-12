@@ -6,6 +6,7 @@ import { getDb, type Db } from '../db/client.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { GoalService } from '../agent/goal-service.ts';
 import { MemoryService } from '../agent/memory.ts';
+import { ContextManager } from '../context/contextManager.ts';
 import { modelRouter } from '../agent/model-router.ts';
 import { eventBus } from '../events/bus.ts';
 import { AuditService } from '../services/audit.ts';
@@ -21,6 +22,8 @@ import { AppError } from '../utils/errors.ts';
 import { fail, ok, parseJson } from '../utils/http.ts';
 import { newId } from '../utils/ids.ts';
 import { config } from '../config.ts';
+import { readFile } from 'node:fs/promises';
+import { safeJoin } from '../tools/fs-tools.ts';
 import * as S from './schemas.ts';
 
 export interface AppDeps {
@@ -33,6 +36,7 @@ export function createApp(deps: AppDeps = {}) {
   const workspaceService = new WorkspaceService(db);
   const goalService = new GoalService(db);
   const memory = new MemoryService(db);
+  const context = new ContextManager(db);
   const files = new FileService(db);
   const schedules = new ScheduleService(db);
   const widgets = new WidgetService(db);
@@ -70,35 +74,124 @@ export function createApp(deps: AppDeps = {}) {
 
   /* ------------------------------ 会话 ------------------------------ */
   app.get('/conversations/:id/messages', async (c) => {
-    return ok(c, { messages: await memory.listMessages(c.req.param('id'), 100) });
+    return ok(c, { messages: await context.listMessages(c.req.param('id'), Number(c.req.query('limit') ?? 100)) });
   });
 
   app.get('/conversations/:id/memory', async (c) => {
-    return ok(c, { facts: await memory.listFacts(c.req.param('id')) });
+    const id = c.req.param('id');
+    return ok(c, {
+      facts: await context.listFacts(id),
+      summaries: await context.listSummaries(id),
+    });
   });
 
+  /** 上下文预览：给 UI 展示「组装后的分层上下文 + 预算 + 溯源」 */
   app.get('/conversations/:id/context-preview', async (c) => {
+    const id = c.req.param('id');
     const q = c.req.query('q') ?? '';
-    return ok(c, await memory.buildContext(c.req.param('id'), q));
+    const files = c.req.query('files');
+    const fileList = files ? files.split(',').filter(Boolean) : [];
+    const bundle = await context.buildContext(id, {
+      query: q,
+      ...(fileList.length
+        ? { files: await loadFileContexts(db, id, fileList) }
+        : {}),
+    });
+    return ok(c, bundle);
+  });
+
+  /** GET /context/:conversationId/summary —— 记忆面板数据源 */
+  app.get('/context/:conversationId/summary', async (c) => {
+    const conversationId = c.req.param('conversationId');
+    const [facts, summaries, messages, rawTokens, budget] = await Promise.all([
+      context.listFacts(conversationId),
+      context.listSummaries(conversationId),
+      context.listMessages(conversationId, 500),
+      context.pendingTokens(conversationId),
+      context.previewBudget(conversationId),
+    ]);
+    const threshold = context.compactThreshold();
+    return ok(c, {
+      conversationId,
+      summaries: summaries.map((s) => ({
+        id: s.id,
+        content: s.content,
+        tokenCount: s.tokenCount,
+        coveredCount: s.coveredCount,
+        kind: s.kind,
+        fromMessageId: s.fromMessageId,
+        toMessageId: s.toMessageId,
+        createdAt: s.createdAt,
+      })),
+      facts,
+      messages: messages.length,
+      rawTokens,
+      compactThreshold: threshold,
+      shouldCompact: rawTokens > threshold,
+      budget,
+    });
+  });
+
+  /** POST /context/:conversationId/compact —— 手动触发滚动摘要 */
+  app.post('/context/:conversationId/compact', async (c) => {
+    const conversationId = c.req.param('conversationId');
+    const body = (await c.req.json().catch(() => ({}))) as { force?: boolean; keepRecent?: number };
+    if (!S.isCompactRequest(body)) throw AppError.badRequest('force 必须是布尔值，keepRecent 必须是 1~500 的整数');
+    const workspaceId = c.req.header('x-workspace-id') ?? undefined;
+    const result = await context.compact(conversationId, {
+      ...(workspaceId ? { workspaceId } : {}),
+      force: body.force ?? false,
+      ...(body.keepRecent !== undefined ? { keepRecent: body.keepRecent } : {}),
+    });
+    await audit.record({
+      workspaceId: workspaceId ?? (await guessWorkspaceId(db, conversationId)),
+      actor: 'user',
+      action: 'context.compact',
+      targetType: 'conversation',
+      targetId: conversationId,
+      confirmedByUser: true,
+      detail: { summarizedMessages: result.summarizedMessages, factsExtracted: result.factsExtracted, degraded: result.degraded },
+    });
+    return ok(c, result);
   });
 
   app.post('/conversations/:id/messages', async (c) => {
     const conversationId = c.req.param('id');
     const body = await parseJson(c, S.isSendMessageRequest, 'message');
-    const userMsg = await memory.appendMessage({ conversationId, role: 'user', content: body.content });
-    const ctx = await memory.buildContext(conversationId, body.content);
-    const chat = await modelRouter.chat({
-      messages: [
-        {
-          role: 'system',
-          content: ['你是 AI 工作台的对话助手。可用上下文如下：', ...ctx.blocks.map((b) => `【${b.kind}】\n${b.content}`)].join('\n\n'),
-        },
-        { role: 'user', content: body.content },
-      ],
+    const userMsg = await context.appendMessage({ conversationId, role: 'user', content: body.content });
+
+    // 超阈值自动滚动摘要（不阻塞当前回答：摘要失败也不影响对话）
+    let compacted = null;
+    if (await context.shouldCompact(conversationId)) {
+      compacted = await context.compact(conversationId, {
+        workspaceId: c.req.header('x-workspace-id') ?? (await guessWorkspaceId(db, conversationId)),
+      }).catch(() => null);
+    }
+
+    const { bundle, messages } = await context.buildPromptMessages(conversationId, body.content);
+    const chat = await modelRouter.chat({ messages });
+    const assistantMsg = await context.appendMessage({
+      conversationId,
+      role: 'assistant',
+      content: chat.content,
+      citations: bundle.citations,
     });
-    const assistantMsg = await memory.appendMessage({ conversationId, role: 'assistant', content: chat.content, citations: ctx.citations });
     await memory.extractFacts(conversationId, c.req.header('x-workspace-id') ?? 'unknown', body.content, userMsg.id);
-    return ok(c, { userMessage: userMsg, assistantMessage: assistantMsg, citations: ctx.citations, degraded: chat.degraded });
+    return ok(c, {
+      userMessage: userMsg,
+      assistantMessage: assistantMsg,
+      citations: bundle.citations,
+      degraded: chat.degraded,
+      /** Phase 2：本次回答使用的上下文预算与路由 */
+      context: {
+        totalTokens: bundle.totalTokens,
+        blocks: bundle.blocks.map((b) => ({ kind: b.kind, tokens: b.tokens, sourceIds: b.sourceIds })),
+        budget: bundle.budget,
+        model: bundle.model,
+        routedByLength: bundle.routedByLength,
+      },
+      compacted,
+    });
   });
 
   /* ----------------------------- Agent ----------------------------- */
@@ -330,6 +423,44 @@ export function createApp(deps: AppDeps = {}) {
   });
 
   return app;
+}
+
+/**
+ * 追加文件上下文：把工作区内的文本文件读入，供上下文组装使用。
+ * 只读取显式传入的相对路径，且受 safeJoin 边界保护。
+ */
+async function loadFileContexts(
+  db: Db,
+  conversationId: string,
+  paths: string[],
+): Promise<{ title: string; content: string; sourceId: string }[]> {
+  const wsRows = await db.query.conversations.findMany({ where: (t, { eq }) => eq(t.id, conversationId), limit: 1 });
+  const workspaceId = wsRows[0]?.workspaceId;
+  if (!workspaceId) return [];
+  const ws = await db.query.workspaces.findMany({ where: (t, { eq }) => eq(t.id, workspaceId), limit: 1 });
+  const root = ws[0]?.rootPath ?? null;
+  const out: { title: string; content: string; sourceId: string }[] = [];
+  for (const rel of paths.slice(0, 20)) {
+    try {
+      const abs = safeJoin(root, rel);
+      const buf = await readFile(abs);
+      const limit = 200_000;
+      out.push({
+        title: rel,
+        content: buf.subarray(0, limit).toString('utf8') + (buf.length > limit ? '\n…（文件过长已截断）' : ''),
+        sourceId: `file:${rel}`,
+      });
+    } catch {
+      // 单文件失败不影响整体上下文组装
+    }
+  }
+  return out;
+}
+
+/** 会话未显式带工作区时，从会话归属推断（用于审计与事实落库） */
+async function guessWorkspaceId(db: Db, conversationId: string): Promise<string> {
+  const rows = await db.query.conversations.findMany({ where: (t, { eq }) => eq(t.id, conversationId), limit: 1 });
+  return rows[0]?.workspaceId ?? conversationId;
 }
 
 export type App = ReturnType<typeof createApp>;
