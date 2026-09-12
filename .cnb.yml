@@ -7,7 +7,7 @@ $:
       runner:
         cpus: 2                  # 内存 = CPU x 2G，即 2 核 4G
       docker:
-        image: node:20
+        image: node:22
       stages:
         - name: npc
           script: echo runner 2cpu 4G
@@ -18,17 +18,19 @@ main:
       runner:
         cpus: 4
       docker:
-        image: node:20
+        image: node:22
       env:
         # 测试环境不配置任何模型密钥，验证「离线兜底」路径
         NODE_ENV: test
       stages:
         - name: install
           script: |
-            set -euo pipefail
-            corepack enable
-            corepack prepare pnpm@9.12.0 --activate
-            pnpm install --no-frozen-lockfile
+            bash -lc '
+              set -euo pipefail
+              corepack enable
+              corepack prepare pnpm@9.12.0 --activate
+              pnpm install --no-frozen-lockfile
+            '
 
         - name: typecheck
           script: pnpm typecheck
@@ -44,14 +46,16 @@ main:
       runner:
         cpus: 4
       docker:
-        image: node:20
+        image: node:22
       stages:
         - name: install
           script: |
-            set -euo pipefail
-            corepack enable
-            corepack prepare pnpm@9.12.0 --activate
-            pnpm install --no-frozen-lockfile
+            bash -lc '
+              set -euo pipefail
+              corepack enable
+              corepack prepare pnpm@9.12.0 --activate
+              pnpm install --no-frozen-lockfile
+            '
 
         - name: typecheck
           script: pnpm typecheck
