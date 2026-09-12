@@ -437,3 +437,135 @@ test('Phase 2 POST /goals/:id/cancel 取消未完成目标', async () => {
   assert.equal(res.status, 200);
   assert.equal(body.data.goal.status, 'cancelled');
 });
+
+/* ------------------------------------------------------------------ */
+/* Phase 2 Step 5：Office 文件处理接口                                  */
+/* ------------------------------------------------------------------ */
+
+test('Phase 2 GET /office/status 返回转换器可用性与配置指引', async () => {
+  const res = await get('/office/status');
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(typeof body.data.available, 'boolean');
+  assert.ok(body.data.hint.length > 0);
+});
+
+test('Phase 2 POST /office/read 解析 docx 并返回结构化内容', async () => {
+  const gen = await post('/office/generate', {
+    workspaceId: boot.workspace.id,
+    format: 'docx',
+    title: 'Phase2 可读',
+    content: '# 行业简报\n\n储能装机量达到 120GW。',
+  });
+  const genBody = await gen.json();
+  const res = await post('/office/read', { workspaceId: boot.workspace.id, path: genBody.data.path });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.format, 'docx');
+  assert.ok(body.data.content.text.includes('120GW'));
+  assert.ok(Array.isArray(body.data.warnings));
+});
+
+test('Phase 2 POST /office/preview 返回 markdown 与渲染器类型', async () => {
+  const gen = await post('/office/generate', {
+    workspaceId: boot.workspace.id,
+    format: 'xlsx',
+    title: 'Phase2 数据表',
+    content: '数据',
+    sheets: [{ name: '装机量', rows: [['年份', 'GW'], [2025, 120]] }],
+  });
+  const path = (await gen.json()).data.path;
+  const res = await post('/office/preview', { workspaceId: boot.workspace.id, path });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.renderer, 'sheetjs');
+  assert.ok(body.data.markdown.includes('| 年份 | GW |'));
+  assert.ok(body.data.downloadUrl.length > 0);
+});
+
+test('Phase 2 POST /office/edit 编辑并产生版本历史，可回滚', async () => {
+  const gen = await post('/office/generate', {
+    workspaceId: boot.workspace.id,
+    format: 'docx',
+    title: 'Phase2 可编辑',
+    content: '# 标题\n\n旧内容。',
+  });
+  const filePath = (await gen.json()).data.path;
+
+  const edit = await post('/office/edit', {
+    workspaceId: boot.workspace.id,
+    path: filePath,
+    operations: [{ op: 'replace', find: '旧内容', replace: '新内容' }, { op: 'append', text: '追加段落' }],
+  });
+  const editBody = await edit.json();
+  assert.equal(edit.status, 200);
+  assert.ok(editBody.data.applied === 2);
+  assert.ok(editBody.data.version >= 2);
+
+  // 版本历史可查询（通过文件 id）
+  let fileId: string | undefined = editBody.data.fileId;
+  if (!fileId) {
+    const filesRes = await get(`/files?workspaceId=${boot.workspace.id}`);
+    const filesBody = await filesRes.json();
+    fileId = filesBody.data.files.find((f: { path: string }) => f.path === filePath)?.id;
+  }
+  assert.ok(fileId, '应能通过路径找到文件记录');
+  const versions = await get(`/files/${fileId}/versions`);
+  const vBody = await versions.json();
+  assert.equal(versions.status, 200);
+  assert.ok(vBody.data.versions.length >= 2);
+  assert.ok(vBody.data.versions.some((v: { note: string }) => v.note.includes('备份')));
+
+  // 回滚到最早版本
+  const earliest = vBody.data.versions.reduce((min: { version: number }, v: { version: number }) => (v.version < min.version ? v : min));
+  const restore = await post(`/files/${fileId}/restore`, { version: earliest.version });
+  const restoreBody = await restore.json();
+  assert.equal(restore.status, 200);
+  assert.equal(restoreBody.data.restoredFrom, earliest.version);
+  assert.ok(restoreBody.data.version > earliest.version, '回滚应产生新版本');
+});
+
+test('Phase 2 POST /office/convert 未配置 LibreOffice 时明确降级', async () => {
+  const gen = await post('/office/generate', {
+    workspaceId: boot.workspace.id,
+    format: 'docx',
+    title: 'Phase2 待转换',
+    content: '内容',
+  });
+  const pathToConvert = (await gen.json()).data.path;
+  const res = await post('/office/convert', { workspaceId: boot.workspace.id, path: pathToConvert, target: 'pdf' });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(body.data.degraded, true);
+  assert.ok(body.data.warnings.join(' ').includes('SOFFICE_PATH'));
+});
+
+test('Phase 2 POST /office/export 返回可下载 URL', async () => {
+  const gen = await post('/office/generate', {
+    workspaceId: boot.workspace.id,
+    format: 'docx',
+    title: 'Phase2 导出',
+    content: '导出内容',
+  });
+  const pathToExport = (await gen.json()).data.path;
+  const res = await post('/office/export', { workspaceId: boot.workspace.id, path: pathToExport, ttlHours: 2 });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.ok(body.data.url.includes('/files/exports/'));
+
+  const download = await get(`/files/exports/${body.data.id}`);
+  assert.equal(download.status, 200);
+  assert.ok(Number(download.headers.get('content-length') ?? 0) > 0);
+});
+
+test('Phase 2 Office 安全边界：路径穿越与非法参数被拒绝', async () => {
+  const res = await post('/office/read', { workspaceId: boot.workspace.id, path: '../../etc/passwd' });
+  const body = await res.json();
+  assert.equal(res.status, 403);
+  assert.equal(body.error.code, 'FORBIDDEN');
+
+  const bad = await post('/office/edit', { workspaceId: boot.workspace.id, path: 'a.docx', operations: [] });
+  assert.equal(bad.status, 400);
+  const badBody = await bad.json();
+  assert.equal(badBody.error.code, 'BAD_REQUEST');
+});

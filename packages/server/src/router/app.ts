@@ -6,6 +6,7 @@ import { getDb, type Db } from '../db/client.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { GoalService } from '../agent/goal-service.ts';
 import { GoalEngine } from '../goals/goalEngine.ts';
+import { OfficeService } from '../office/officeService.ts';
 import { MemoryService } from '../agent/memory.ts';
 import { ContextManager } from '../context/contextManager.ts';
 import { modelRouter } from '../agent/model-router.ts';
@@ -38,6 +39,7 @@ export function createApp(deps: AppDeps = {}) {
   const workspaceService = new WorkspaceService(db);
   const goalService = new GoalService(db);
   const goalEngine = new GoalEngine(db);
+  const office = new OfficeService(db);
   const memory = new MemoryService(db);
   const context = new ContextManager(db);
   const files = new FileService(db);
@@ -430,6 +432,126 @@ export function createApp(deps: AppDeps = {}) {
     await audit.record({ workspaceId: ws.id, actor: 'user', action: 'office.generate', targetType: 'artifact', targetId: artifact.id, confirmedByUser: true, detail: { format: body.format, path: data.path } });
     eventBus.publishBuffered(EventType.ARTIFACT_CREATED, artifact, { workspaceId: ws.id, goalId: body.goalId ?? null, taskId: null });
     return ok(c, { artifact, path: data.path }, 201);
+  });
+
+  /* ------------------- Phase 2：Office 文件处理 ------------------- */
+
+  /** 统一解析 office 上下文（工作区 + 根目录，安全默认：未配置 rootPath 直接拒绝） */
+  async function officeCtx(workspaceId: string) {
+    const ws = await workspaceService.getById(workspaceId);
+    return { workspaceId: ws.id, workspaceRoot: ws.rootPath ?? null };
+  }
+
+  app.get('/office/status', async (c) => ok(c, await office.converterStatus()));
+
+  /** POST /files/:id/read —— 按文件记录读取（含 docx/xlsx/pptx/pdf 解析） */
+  app.get('/files/:id/content', async (c) => {
+    const fileId = c.req.param('id');
+    const rows = await db.query.files.findMany({ where: (t, { eq }) => eq(t.id, fileId), limit: 1 });
+    const file = rows[0];
+    if (!file) throw AppError.notFound(`文件不存在: ${fileId}`);
+    const ctx = await officeCtx(file.workspaceId);
+    return ok(c, await office.read(ctx, file.path));
+  });
+
+  app.get('/files/:id/versions', async (c) => {
+    const fileId = c.req.param('id');
+    const rows = await db.query.files.findMany({ where: (t, { eq }) => eq(t.id, fileId), limit: 1 });
+    const file = rows[0];
+    if (!file) throw AppError.notFound(`文件不存在: ${fileId}`);
+    return ok(c, await office.listVersions(await officeCtx(file.workspaceId), fileId));
+  });
+
+  app.post('/files/:id/restore', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { version?: number };
+    if (typeof body.version !== 'number' || body.version < 1) throw AppError.badRequest('version 必须是 ≥1 的整数');
+    const fileId = c.req.param('id');
+    const rows = await db.query.files.findMany({ where: (t, { eq }) => eq(t.id, fileId), limit: 1 });
+    const file = rows[0];
+    if (!file) throw AppError.notFound(`文件不存在: ${fileId}`);
+    const result = await office.restore(await officeCtx(file.workspaceId), fileId, body.version);
+    await audit.record({
+      workspaceId: file.workspaceId,
+      actor: 'user',
+      action: 'file.restore',
+      targetType: 'file',
+      targetId: fileId,
+      confirmedByUser: true,
+      detail: { restoredFrom: body.version, version: result.version },
+    });
+    eventBus.publishBuffered(EventType.FILE_VERSION, result, { workspaceId: file.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.get('/files/exports/:exportId', async (c) => {
+    const { row, expired } = await office.resolveExport(c.req.param('exportId'));
+    if (expired) throw AppError.notFound('导出链接已过期，请重新导出');
+    const { readFile } = await import('node:fs/promises');
+    const pathMod = await import('node:path');
+    const abs = pathMod.join(config.storageDir, row.storagePath);
+    const buf = await readFile(abs).catch(() => null);
+    if (!buf) throw AppError.notFound('导出内容缺失');
+    return new Response(new Uint8Array(buf), {
+      headers: {
+        'content-type': row.mime,
+        'content-disposition': `attachment; filename="${encodeURIComponent(pathMod.basename(row.storagePath))}"`,
+        'content-length': String(buf.length),
+      },
+    });
+  });
+
+  /** POST /office/read —— 读取并解析工作区文件 */
+  app.post('/office/read', async (c) => {
+    const body = await parseJson(c, S.isOfficeReadRequest, 'office.read');
+    return ok(c, await office.read(await officeCtx(body.workspaceId), body.path));
+  });
+
+  /** POST /office/preview —— 结构化预览（供 UI 渲染） */
+  app.post('/office/preview', async (c) => {
+    const body = await parseJson(c, S.isOfficeReadRequest, 'office.preview');
+    return ok(c, await office.preview(await officeCtx(body.workspaceId), body.path));
+  });
+
+  /** POST /office/edit —— 原地编辑（不破坏格式，编辑前自动备份版本） */
+  app.post('/office/edit', async (c) => {
+    const body = await parseJson(c, S.isOfficeEditRequest, 'office.edit');
+    const ctx = await officeCtx(body.workspaceId);
+    const result = await office.edit(ctx, body.path, body.operations, { backup: body.backup !== false });
+    await audit.record({
+      workspaceId: body.workspaceId,
+      actor: 'user',
+      action: 'office.edit',
+      targetType: 'file',
+      targetId: body.path,
+      confirmedByUser: true,
+      detail: { operations: body.operations.length, applied: result.applied, version: result.version },
+    });
+    eventBus.publishBuffered(EventType.OFFICE_FILE_CHANGED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  /** POST /office/convert —— LibreOffice headless 转换（未配置时显式降级） */
+  app.post('/office/convert', async (c) => {
+    const body = await parseJson(c, S.isOfficeConvertRequest, 'office.convert');
+    const result = await office.convert(await officeCtx(body.workspaceId), body.path, body.target, body.outputPath);
+    await audit.record({
+      workspaceId: body.workspaceId,
+      actor: 'user',
+      action: 'office.convert',
+      targetType: 'file',
+      targetId: body.path,
+      confirmedByUser: true,
+      detail: { target: body.target, degraded: result.degraded, path: result.path },
+    });
+    return ok(c, result);
+  });
+
+  /** POST /office/export —— 生成可下载 / 可发布 URL */
+  app.post('/office/export', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; path?: string; ttlHours?: number };
+    if (!body.workspaceId || !body.path) throw AppError.badRequest('workspaceId 与 path 必填');
+    const result = await office.export(await officeCtx(body.workspaceId), body.path, body.ttlHours === undefined ? {} : { ttlHours: body.ttlHours });
+    return ok(c, result, 201);
   });
 
   /* ---------------------------- 深度研究 --------------------------- */
