@@ -54,7 +54,8 @@ export const CURATED_PLUGINS: PluginManifest[] = [
     kind: 'mcp',
     source: 'market://mcp/web-fetch',
     permissions: [{ scope: 'net:http', description: '发起网络请求（遵守 robots.txt）', sensitive: true }],
-    requiresUserAuth: true,
+    // 无需凭据；但联网行为仍需用户在安装时确认（权限声明为 sensitive）
+    requiresUserAuth: false,
     secretRefs: [],
     sandbox: true,
     config: { respectRobots: true },

@@ -15,7 +15,12 @@
     "db:migrate": "tsx src/db/migrate.ts",
     "perf:million": "tsx scripts/perf-million-tokens.ts",
     "test:context": "node --test --experimental-transform-types \"src/context/**/*.test.ts\"",
-    "db:rollback": "tsx src/db/migrate.ts --rollback"
+    "db:rollback": "tsx src/db/migrate.ts --rollback",
+    "test:security": "node --test --experimental-transform-types \"test/security.test.ts\"",
+    "test:research": "node --test --experimental-transform-types \"src/research/**/*.test.ts\"",
+    "test:office": "node --test --experimental-transform-types \"src/office/**/*.test.ts\"",
+    "test:goals": "node --test --experimental-transform-types \"src/goals/**/*.test.ts\"",
+    "verify:rollback": "tsx scripts/verify-rollback.ts"
   },
   "dependencies": {
     "@ai/shared": "workspace:*",

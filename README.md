@@ -313,3 +313,88 @@ pnpm typecheck            # 三个包的类型检查
 3. **Phase 3**：实现 Vercel / Cloudflare Pages Provider 适配器与 Neon 编排
 4. **Phase 3**：推送渠道（桌面通知 / 邮件 / Webhook / 飞书 / 钉钉 / 企业微信）
 5. **Phase 4**：跨机集群调度（BullMQ + Redis）、MCP 插件宿主进程隔离
+
+
+---
+
+## Phase 2 目录结构（增量）
+
+```
+packages/server/src/
+├── context/                     # 百万 Token 分层上下文
+│   ├── contextManager.ts        # 统一入口：存储/组装/压缩/事实/预算/路由/溯源
+│   ├── tokenBudget.ts           # 六分区预算 + 输出预留 + 借用 + 截断（纯函数）
+│   ├── summarizer.ts            # 滚动摘要（模型优先，离线抽取式兜底）
+│   ├── factExtractor.ts         # 事实抽取（规则 + 模型，带分类与溯源）
+│   ├── vectorRecall.ts          # 向量 + 关键词混合召回（时间衰减 + 预算截断）
+│   └── embedding.ts             # 本地确定性 embedding / 远端可选
+├── goals/                       # 目标模式
+│   ├── goalEngine.ts            # 编队循环：GoalRun 持久化/并行限流/修正/审计
+│   ├── progressTree.ts          # 目标 → 任务 → 子任务（纯函数）
+│   ├── reflection.ts            # 重试/换角色/换工具/请求授权/放弃 + 停滞检测
+│   └── audit.ts                 # 结构化审计：逐条对齐验收标准并给出证据
+├── office/                      # Office 处理
+│   ├── zip.ts                   # 零依赖 ZIP 读写（确定性输出）
+│   ├── parse.ts                 # docx/xlsx/pptx/pdf 解析（含 PDF 对象流）
+│   ├── edit.ts                  # 原地编辑 OOXML（不破坏格式）
+│   ├── converter.ts             # LibreOffice headless（可选依赖）
+│   └── officeService.ts         # 读取/预览/编辑/生成/转换/版本/导出 + 安全边界
+├── research/                    # 深度研究
+│   ├── robots.ts                # robots.txt 合规（最长匹配、缓存、保守拒绝）
+│   ├── search.ts                # 检索（用户端点优先，否则本地素材）
+│   ├── fetch.ts                 # 合规抓取（noindex 尊重、限流、超时、体积上限）
+│   ├── crossValidate.ts         # 论断级多源交叉验证（数值冲突检测）
+│   ├── citations.ts             # 引用编号 + 一致性校验
+│   ├── charts.ts                # Mermaid 图表
+│   ├── report.ts                # 结构化报告 + 润色安全校验
+│   └── researchEngine.ts        # 11 步流程编排 + 导出 + 网页发布
+└── db/migrations/
+    ├── 0002_phase2.sql          # Phase 2 表与列
+    └── 0002_phase2.down.sql     # 独立回滚脚本
+
+packages/desktop/src/
+├── pages/
+│   ├── GoalPage.tsx             # 目标模式（进度树 + 阻塞项 + 结构化审计）
+│   ├── AgentClusterPage.tsx     # Agent 集群（模式开关 + 节点图 + 消息流 + 看板）
+│   ├── OfficeWorkspacePage.tsx  # Office 工作区（预览/编辑/转换/版本/导出）
+│   ├── ResearchPage.tsx         # 深度研究（进度/来源/冲突/报告/发布）
+│   └── MemoryPanelPage.tsx      # 记忆面板（摘要/事实/预算/召回溯源）
+├── components/
+│   ├── ProgressTree.tsx         # 进度树
+│   ├── TokenBudgetBar.tsx       # Token 预算条
+│   ├── TaskBoard.tsx            # 任务看板（取消/改派/抢占）
+│   └── AgentNode.tsx            # Agent 节点（状态/任务/最近消息）
+└── lib/confirm.ts               # 危险操作确认统一入口（可注入替身）
+```
+
+---
+
+## Phase 2 运行命令
+
+```bash
+# 全量校验
+pnpm typecheck        # 三个包的类型检查
+pnpm test             # 全量测试（server 238 + desktop 4）
+
+# 分能力测试
+pnpm test:context     # Step 1 分层上下文
+pnpm test:security    # Step 8 安全与权限
+pnpm --filter @ai/server test:goals      # 目标模式
+pnpm --filter @ai/server test:office     # Office 处理
+pnpm --filter @ai/server test:research   # 深度研究
+
+# 规模验证（百万 token）
+pnpm perf:million
+
+# 迁移与回滚
+pnpm db:migrate
+pnpm db:rollback 0002_phase2.sql
+
+# 启动
+pnpm dev:server       # 后端 :8787
+pnpm dev:desktop      # 前端 :5183
+```
+
+> **不配置任何密钥也能跑通全链路**：系统进入离线兜底模式，
+> 摘要走抽取式、审计走确定性规则、报告走结构化模板，
+> 所有降级结果都显式标注 `degraded`，不会静默冒充真实输出。

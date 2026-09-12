@@ -49,7 +49,13 @@ export class ToolRegistry {
   }
 
   async invoke(name: string, args: Record<string, unknown>, ctx: ToolContext): Promise<ToolResult> {
-    const tool = this.get(name);
+    // 未知工具必须返回失败结果而不是抛出：模型可能编造工具名，
+    // 抛出会让整个任务中断，返回结果则能让 Critic 触发「换工具」修正。
+    const tool = this.tools.get(name);
+    if (!tool) {
+      logger.warn('tool not found', { tool: name, agentId: ctx.agentId });
+      return { ok: false, error: `工具不存在: ${name}（可用工具：${[...this.tools.keys()].join(', ')}）` };
+    }
     if (tool.dangerous && !ctx.userConfirmed) {
       logger.warn('tool blocked by permission gate', { tool: name, workspaceId: ctx.workspaceId });
       return {
