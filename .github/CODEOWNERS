@@ -1,0 +1,9 @@
+# 默认由维护者审阅所有变更
+*                       @wxz1gh46
+
+# 关键路径需要额外关注
+/packages/server/src/db/            @wxz1gh46
+/packages/server/src/security/      @wxz1gh46
+/packages/shared/src/types/         @wxz1gh46
+/.github/                           @wxz1gh46
+SECURITY.md                         @wxz1gh46

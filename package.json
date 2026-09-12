@@ -2,11 +2,11 @@
   "name": "ai-workbench",
   "version": "0.1.0",
   "private": true,
-  "description": "\u684c\u9762 AI \u5de5\u4f5c\u53f0\uff1a\u76ee\u6807\u9a71\u52a8\u3001\u591a Agent \u5e76\u884c\u3001Office \u5904\u7406\u3001\u6df1\u5ea6\u7814\u7a76\u3001\u7f51\u7ad9\u90e8\u7f72\u3001\u767e\u4e07 Token \u4e0a\u4e0b\u6587",
+  "description": "桌面 AI 工作台：目标驱动、多 Agent 并行、Office 处理、深度研究、网站部署、百万 Token 上下文",
   "type": "module",
   "packageManager": "pnpm@9.12.0",
   "engines": {
-    "node": ">=20"
+    "node": ">=22.6"
   },
   "scripts": {
     "dev": "pnpm -r --parallel dev",

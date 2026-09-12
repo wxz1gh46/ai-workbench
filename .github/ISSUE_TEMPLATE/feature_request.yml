@@ -1,0 +1,58 @@
+name: ✨ 功能建议
+description: 提出一个新功能或改进
+title: "[Feature] "
+labels: ["enhancement", "needs-triage"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        请先说明要解决的问题，而不是直接给方案——这样更容易找到更优解。
+
+  - type: textarea
+    id: problem
+    attributes:
+      label: 你想解决什么问题
+      description: 描述痛点与场景
+    validations:
+      required: true
+
+  - type: textarea
+    id: solution
+    attributes:
+      label: 你设想的方案
+    validations:
+      required: false
+
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: 你考虑过的替代方案
+    validations:
+      required: false
+
+  - type: dropdown
+    id: area
+    attributes:
+      label: 能力领域
+      options:
+        - 集群与分布式调度
+        - 多 Agent 并行
+        - 插件与 MCP
+        - 付费数据库接入
+        - 提示词工程
+        - 企业安全与审计
+        - UI / 交互
+        - 文档
+        - 其他
+    validations:
+      required: true
+
+  - type: checkboxes
+    id: compliance
+    attributes:
+      label: 合规确认
+      options:
+        - label: 该功能不涉及绕过反爬、共享账号或破解授权
+          required: true
+        - label: 该功能不需要在代码中硬编码任何密钥
+          required: true

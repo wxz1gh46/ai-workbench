@@ -1,5 +1,6 @@
-# AI 工作台流水线
-# 保留既有的 issue.comment@npc（NPC 触发），新增 push / pull_request 的校验与测试。
+# AI 工作台流水线与 CNB 平台配置
+# 与 .github/workflows/ci.yml 保持同构：安装 -> 类型检查 -> 测试 -> 构建
+# Node 必须 >= 22.6（测试使用 node:test 的 --experimental-transform-types）
 $:
   # NPC 触发：评论中 @npc 时唤起
   issue.comment@npc:
@@ -29,7 +30,7 @@ main:
               set -euo pipefail
               corepack enable
               corepack prepare pnpm@9.12.0 --activate
-              pnpm install --no-frozen-lockfile
+              pnpm install --frozen-lockfile
             '
 
         - name: typecheck
@@ -37,6 +38,22 @@ main:
 
         - name: test
           script: pnpm test
+
+        - name: secret-scan
+          script: |
+            bash -lc '
+              set -euo pipefail
+              patterns="(sk-[A-Za-z0-9]{16,}|AKIA[0-9A-Z]{12,}|ghp_[A-Za-z0-9]{20,}|gho_[A-Za-z0-9]{20,}|xox[baprs]-[A-Za-z0-9-]{10,}|-----BEGIN [A-Z ]*PRIVATE KEY-----)"
+              hits="$(grep -rEIln "$patterns" . \
+                --exclude-dir=node_modules --exclude-dir=.git --exclude-dir=dist --exclude-dir=target \
+                --exclude="*.test.ts" --exclude="*.test.tsx" \
+                --exclude="DECISIONS.md" --exclude="CHANGELOG.md" --exclude="SECURITY.md" --exclude="CONTRIBUTING.md" \
+                || true)"
+              if [ -n "$hits" ]; then
+                echo "❌ 发现疑似硬编码凭据："; echo "$hits"; exit 1
+              fi
+              echo "✅ 未发现疑似凭据"
+            '
 
         - name: build-desktop
           script: pnpm --filter @ai/desktop build
@@ -47,6 +64,8 @@ main:
         cpus: 4
       docker:
         image: node:22
+      env:
+        NODE_ENV: test
       stages:
         - name: install
           script: |
@@ -54,7 +73,7 @@ main:
               set -euo pipefail
               corepack enable
               corepack prepare pnpm@9.12.0 --activate
-              pnpm install --no-frozen-lockfile
+              pnpm install --frozen-lockfile
             '
 
         - name: typecheck

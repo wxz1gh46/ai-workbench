@@ -1,0 +1,44 @@
+version: 2
+updates:
+  - package-ecosystem: npm
+    directory: /
+    schedule:
+      interval: weekly
+      day: monday
+      time: "09:00"
+      timezone: Asia/Shanghai
+    open-pull-requests-limit: 5
+    labels:
+      - dependencies
+    commit-message:
+      prefix: "chore(deps)"
+    groups:
+      # 开发依赖合并成一个 PR，减少噪音
+      dev-dependencies:
+        dependency-type: development
+      # 生产依赖按 patch/minor 分组
+      production-minor-patch:
+        dependency-type: production
+        update-types:
+          - minor
+          - patch
+
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - ci
+    commit-message:
+      prefix: "ci(deps)"
+
+  - package-ecosystem: cargo
+    directory: /packages/desktop/src-tauri
+    schedule:
+      interval: monthly
+    labels:
+      - dependencies
+      - rust
+    commit-message:
+      prefix: "chore(deps)"
