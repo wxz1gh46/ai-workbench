@@ -8,7 +8,7 @@
 
 [![CI](https://github.com/wxz1gh46/ai-workbench/actions/workflows/ci.yml/badge.svg)](https://github.com/wxz1gh46/ai-workbench/actions/workflows/ci.yml)
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Node](https://img.shields.io/badge/node-%3E%3D20-brightgreen.svg)](package.json)
+[![Node](https://img.shields.io/badge/node-%3E%3D22.6-brightgreen.svg)](package.json)
 [![pnpm](https://img.shields.io/badge/pnpm-9.12.0-orange.svg)](package.json)
 [![Tests](https://img.shields.io/badge/tests-438%20passing-success.svg)](#测试)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](CONTRIBUTING.md)
@@ -101,7 +101,7 @@
 
 ### 环境要求
 
-- Node.js ≥ 20（CI 使用 20，开发用 24）
+- Node.js ≥ 22.6（测试用 `node:test` 的 `--experimental-transform-types` 需要；CI 使用 22）
 - pnpm ≥ 9
 - 可选：Rust 1.77+（构建原生桌面壳）、LibreOffice（跨格式转换）
 

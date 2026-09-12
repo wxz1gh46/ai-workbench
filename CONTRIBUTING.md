@@ -6,7 +6,7 @@
 
 | 依赖 | 版本 | 说明 |
 | --- | --- | --- |
-| Node.js | ≥ 20（开发用 24） | CI 使用 Node 20 |
+| Node.js | ≥ 22.6 | CI 使用 Node 22（`--experimental-transform-types` 所需） |
 | pnpm | ≥ 9 | 仓库指定 `pnpm@9.12.0` |
 | Rust | 1.77+ | 仅构建 Tauri 桌面壳时需要 |
 | build-essential + python3 | — | `better-sqlite3` 原生编译所需 |
