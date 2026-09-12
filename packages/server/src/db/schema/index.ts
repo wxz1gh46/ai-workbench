@@ -81,6 +81,10 @@ export const conversationSummaries = sqliteTable(
     toMessageId: text('to_message_id').notNull(),
     content: text('content').notNull(),
     tokenCount: integer('token_count').notNull().default(0),
+    /** Phase 2：rolling 滚动摘要 / manual 手动压缩 */
+    kind: text('kind').notNull().default('rolling'),
+    /** Phase 2：本次摘要覆盖的消息条数 */
+    coveredCount: integer('covered_count').notNull().default(0),
     createdAt: createdAt(),
   },
   (t) => ({ convIdx: index('summaries_conv_idx').on(t.conversationId) }),
@@ -100,6 +104,13 @@ export const memoryFacts = sqliteTable(
     value: text('value').notNull(),
     sourceMessageId: text('source_message_id'),
     importance: real('importance').notNull().default(0.5),
+    /** Phase 2：向量表示（JSON 数组，本地或远端 embedding） */
+    embedding: json('embedding').$type<number[] | null>(),
+    /** Phase 2：被召回次数 */
+    recallCount: integer('recall_count').notNull().default(0),
+    /** Phase 2：事实分类 fact/decision/constraint/preference */
+    factType: text('fact_type').notNull().default('fact'),
+    updatedAt: updatedAt(),
     createdAt: createdAt(),
   },
   (t) => ({ convKeyIdx: index('facts_conv_key_idx').on(t.conversationId, t.key) }),
@@ -159,6 +170,14 @@ export const tasks = sqliteTable(
     input: json('input').$type<Record<string, unknown>>().notNull().default({}),
     output: json('output').$type<Record<string, unknown> | null>(),
     error: text('error'),
+    /** Phase 2：Critic 对该任务的反思结论 */
+    reflection: text('reflection').notNull().default(''),
+    /** Phase 2：产出摘要（供进度树与看板展示） */
+    outputSummary: text('output_summary'),
+    /** Phase 2：最近一次执行该任务的 Agent */
+    lastAgentId: text('last_agent_id'),
+    /** Phase 2：该任务累计消耗 token */
+    tokensUsed: integer('tokens_used').notNull().default(0),
     createdAt: createdAt(),
     updatedAt: updatedAt(),
     startedAt: text('started_at'),
@@ -260,6 +279,12 @@ export const agentMessages = sqliteTable(
     toAgentId: text('to_agent_id'),
     topic: text('topic').notNull(),
     payload: json('payload').$type<Record<string, unknown>>().notNull().default({}),
+    /** Phase 2：话题线程，便于 UI 聚合 */
+    threadId: text('thread_id').notNull().default(''),
+    /** Phase 2：消息种类 */
+    kind: text('kind').notNull().default('broadcast'),
+    /** Phase 2：可读消息正文 */
+    content: text('content').notNull().default(''),
     createdAt: createdAt(),
   },
   (t) => ({ goalIdx: index('agent_messages_goal_idx').on(t.goalId) }),
@@ -565,4 +590,216 @@ export const notificationChannels = sqliteTable(
     createdAt: createdAt(),
   },
   (t) => ({ wsIdx: index('channels_ws_idx').on(t.workspaceId) }),
+);
+
+/* ================================================================== */
+/* Phase 2 增量表                                                      */
+/* ================================================================== */
+
+/** 目标推进轮次记录，支持回放、审计与回滚 */
+export const goalRuns = sqliteTable(
+  'goal_runs',
+  {
+    id: id(),
+    goalId: text('goal_id')
+      .notNull()
+      .references(() => goals.id, { onDelete: 'cascade' }),
+    iteration: integer('iteration').notNull().default(0),
+    status: text('status', { enum: ['running', 'succeeded', 'failed', 'cancelled'] })
+      .notNull()
+      .default('running'),
+    plan: json('plan').$type<Record<string, unknown> | null>(),
+    reflection: text('reflection').notNull().default(''),
+    auditReport: text('audit_report'),
+    taskIds: json('task_ids').$type<string[]>().notNull().default([]),
+    tokensUsed: integer('tokens_used').notNull().default(0),
+    startedAt: text('started_at').notNull(),
+    finishedAt: text('finished_at'),
+  },
+  (t) => ({ goalIdx: index('goal_runs_goal_idx').on(t.goalId, t.iteration) }),
+);
+
+/** 结构化完成审计报告 */
+export const goalAudits = sqliteTable(
+  'goal_audits',
+  {
+    id: id(),
+    goalId: text('goal_id')
+      .notNull()
+      .references(() => goals.id, { onDelete: 'cascade' }),
+    passed: integer('passed', { mode: 'boolean' }).notNull().default(false),
+    score: integer('score').notNull().default(0),
+    criteria: json('criteria').$type<{ criterion: string; met: boolean; evidence: string }[]>().notNull().default([]),
+    issues: json('issues').$type<{ severity: 'low' | 'medium' | 'high'; detail: string }[]>().notNull().default([]),
+    nextActions: json('next_actions').$type<string[]>().notNull().default([]),
+    markdown: text('markdown').notNull().default(''),
+    degraded: integer('degraded', { mode: 'boolean' }).notNull().default(false),
+    createdAt: createdAt(),
+  },
+  (t) => ({ goalIdx: index('goal_audits_goal_idx').on(t.goalId, t.createdAt) }),
+);
+
+/** Agent 集群配置（含降级开关） */
+export const clusterConfigs = sqliteTable('cluster_configs', {
+  workspaceId: text('workspace_id')
+    .primaryKey()
+    .references(() => workspaces.id, { onDelete: 'cascade' }),
+  mode: text('mode', { enum: ['single', 'parallel', 'cluster'] }).notNull().default('parallel'),
+  maxParallel: integer('max_parallel').notNull().default(4),
+  nodeId: text('node_id').notNull().default('local'),
+  experimental: integer('experimental', { mode: 'boolean' }).notNull().default(false),
+  updatedAt: updatedAt(),
+});
+
+/** Office 文档解析缓存 */
+export const officeDocuments = sqliteTable(
+  'office_documents',
+  {
+    id: id(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    fileId: text('file_id'),
+    path: text('path').notNull(),
+    format: text('format').notNull(),
+    content: json('content').$type<Record<string, unknown>>().notNull().default({}),
+    meta: json('meta').$type<Record<string, unknown>>().notNull().default({}),
+    warnings: json('warnings').$type<string[]>().notNull().default([]),
+    parsedAt: text('parsed_at').notNull(),
+  },
+  (t) => ({ wsPathIdx: uniqueIndex('office_docs_ws_path_idx').on(t.workspaceId, t.path) }),
+);
+
+/** Office 预览结果 */
+export const officePreviews = sqliteTable(
+  'office_previews',
+  {
+    id: id(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    path: text('path').notNull(),
+    format: text('format').notNull(),
+    markdown: text('markdown').notNull().default(''),
+    renderer: text('renderer').notNull().default('markdown'),
+    createdAt: createdAt(),
+  },
+  (t) => ({ wsPathIdx: index('office_previews_ws_path_idx').on(t.workspaceId, t.path) }),
+);
+
+/** 导出记录：文件 → 可下载 / 可发布 URL */
+export const fileExports = sqliteTable(
+  'file_exports',
+  {
+    id: id(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    fileId: text('file_id').notNull(),
+    version: integer('version').notNull().default(1),
+    storagePath: text('storage_path').notNull(),
+    mime: text('mime').notNull().default('application/octet-stream'),
+    size: integer('size').notNull().default(0),
+    url: text('url'),
+    expiresAt: text('expires_at'),
+    createdAt: createdAt(),
+  },
+  (t) => ({ fileIdx: index('file_exports_file_idx').on(t.fileId) }),
+);
+
+/** 深度研究任务 */
+export const researchJobs = sqliteTable(
+  'research_jobs',
+  {
+    id: id(),
+    workspaceId: text('workspace_id')
+      .notNull()
+      .references(() => workspaces.id, { onDelete: 'cascade' }),
+    topic: text('topic').notNull(),
+    depth: text('depth', { enum: ['quick', 'standard', 'deep'] }).notNull().default('standard'),
+    status: text('status', {
+      enum: [
+        'pending',
+        'searching',
+        'fetching',
+        'extracting',
+        'validating',
+        'analyzing',
+        'writing',
+        'completed',
+        'failed',
+        'cancelled',
+      ],
+    })
+      .notNull()
+      .default('pending'),
+    queries: json('queries').$type<string[]>().notNull().default([]),
+    progress: integer('progress').notNull().default(0),
+    stage: text('stage').notNull().default(''),
+    outputFormats: json('output_formats').$type<string[]>().notNull().default(['markdown']),
+    allowNetwork: integer('allow_network', { mode: 'boolean' }).notNull().default(false),
+    error: text('error'),
+    createdAt: createdAt(),
+    finishedAt: text('finished_at'),
+  },
+  (t) => ({ wsIdx: index('research_jobs_ws_idx').on(t.workspaceId, t.createdAt) }),
+);
+
+/** 研究来源（可溯源引用） */
+export const researchSources = sqliteTable(
+  'research_sources',
+  {
+    id: id(),
+    researchJobId: text('research_job_id')
+      .notNull()
+      .references(() => researchJobs.id, { onDelete: 'cascade' }),
+    url: text('url').notNull(),
+    title: text('title').notNull().default(''),
+    snippet: text('snippet').notNull().default(''),
+    content: text('content').notNull().default(''),
+    accessedAt: text('accessed_at').notNull(),
+    reliability: real('reliability').notNull().default(0.5),
+    requiresAuth: integer('requires_auth', { mode: 'boolean' }).notNull().default(false),
+  },
+  (t) => ({ jobIdx: index('research_sources_job_idx').on(t.researchJobId) }),
+);
+
+/** 交叉验证出的论断（含冲突标记） */
+export const researchClaims = sqliteTable(
+  'research_claims',
+  {
+    id: id(),
+    researchJobId: text('research_job_id')
+      .notNull()
+      .references(() => researchJobs.id, { onDelete: 'cascade' }),
+    claim: text('claim').notNull(),
+    supportingSources: json('supporting_sources').$type<string[]>().notNull().default([]),
+    conflictingSources: json('conflicting_sources').$type<string[]>().notNull().default([]),
+    confidence: real('confidence').notNull().default(0.5),
+    disputed: integer('disputed', { mode: 'boolean' }).notNull().default(false),
+  },
+  (t) => ({ jobIdx: index('research_claims_job_idx').on(t.researchJobId) }),
+);
+
+/** 研究报告产物 */
+export const researchReports = sqliteTable(
+  'research_reports',
+  {
+    id: id(),
+    researchJobId: text('research_job_id')
+      .notNull()
+      .references(() => researchJobs.id, { onDelete: 'cascade' }),
+    markdown: text('markdown').notNull().default(''),
+    charts: json('charts').$type<{ title: string; kind: string; data: unknown }[]>().notNull().default([]),
+    referencesJson: json('references_json')
+      .$type<{ index: number; sourceId: string; title: string; url: string; accessedAt: string; snippet: string }[]>()
+      .notNull()
+      .default([]),
+    markdownPath: text('markdown_path'),
+    pdfPath: text('pdf_path'),
+    pptxPath: text('pptx_path'),
+    webUrl: text('web_url'),
+    createdAt: createdAt(),
+  },
+  (t) => ({ jobIdx: uniqueIndex('research_reports_job_idx').on(t.researchJobId) }),
 );

@@ -43,6 +43,34 @@ export const config = {
     model: env('AI_MODEL', 'gpt-4o-mini'),
     longContextModel: env('AI_LONG_CONTEXT_MODEL', 'gpt-4.1'),
     longContextThreshold: num('AI_LONG_CONTEXT_THRESHOLD', 120_000),
+    /** 远端 embedding 模型；留空则使用本地确定性 embedding（离线可用） */
+    embeddingModel: env('AI_EMBEDDING_MODEL'),
+    /** 递归摘要用的「便宜」模型，留空则复用默认模型 */
+    summaryModel: env('AI_SUMMARY_MODEL'),
+    /** 单次请求的上下文总预算，可按模型能力调整 */
+    contextBudget: num('AI_CONTEXT_BUDGET', 200_000),
+    /** 滚动摘要触发阈值（token）；0 表示按上下文预算自动推算 */
+    compactThreshold: num('AI_COMPACT_THRESHOLD', 0),
+  },
+
+  /** 联网检索：全部需要用户自行配置，不内置任何第三方密钥 */
+  research: {
+    /** 自建检索服务（SearXNG 等）的 base url，留空则禁用联网 */
+    searchEndpoint: env('RESEARCH_SEARCH_ENDPOINT'),
+    searchApiKey: env('RESEARCH_SEARCH_API_KEY'),
+    /** 抓取并发与超时 */
+    fetchConcurrency: num('RESEARCH_FETCH_CONCURRENCY', 4),
+    fetchTimeoutMs: num('RESEARCH_FETCH_TIMEOUT_MS', 15_000),
+    maxBytesPerPage: num('RESEARCH_MAX_BYTES_PER_PAGE', 400_000),
+    userAgent: env('RESEARCH_USER_AGENT', 'AIWorkbenchBot/0.2 (+local research; contact: user-configured)'),
+    /** 合规：是否遵守 robots.txt（默认遵守，不允许关闭绕过） */
+    respectRobots: true,
+  },
+
+  /** Office 转换：LibreOffice headless 可执行文件路径，留空则显式降级 */
+  office: {
+    sofficePath: env('SOFFICE_PATH'),
+    convertTimeoutMs: num('OFFICE_CONVERT_TIMEOUT_MS', 60_000),
   },
 
   /** 阶段开关：未实现的 Phase 默认关闭，UI 上显示为「未启用」 */

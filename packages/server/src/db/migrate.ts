@@ -1,4 +1,4 @@
-import { readFileSync, readdirSync } from 'node:fs';
+import { existsSync, readFileSync, readdirSync } from 'node:fs';
 import path from 'node:path';
 import { getSqlite } from './client.ts';
 import { logger } from '../utils/logger.ts';
@@ -22,8 +22,9 @@ export function runMigrations(): string[] {
     (sqlite.prepare('SELECT name FROM _migrations').all() as { name: string }[]).map((r) => r.name),
   );
 
+  // 只加载「向上」迁移；*.down.sql 是回滚脚本，由 rollback() 显式使用，不能按顺序执行
   const files = readdirSync(MIGRATIONS_DIR)
-    .filter((f) => f.endsWith('.sql'))
+    .filter((f) => f.endsWith('.sql') && !f.endsWith('.down.sql'))
     .sort();
 
   const executed: string[] = [];
@@ -42,6 +43,45 @@ export function runMigrations(): string[] {
   return executed;
 }
 
+/**
+ * 回滚指定迁移（默认回滚最后一个已应用的）。
+ * 用于「每个 Step 可独立回滚」的验收要求；只删除该迁移新增的结构。
+ */
+export function rollback(name?: string): string | null {
+  const sqlite = getSqlite();
+  const applied = (sqlite.prepare('SELECT name FROM _migrations ORDER BY name').all() as { name: string }[]).map((r) => r.name);
+  const target = name ?? applied.at(-1);
+  if (!target) {
+    logger.warn('rollback skipped: no migration applied');
+    return null;
+  }
+  if (!applied.includes(target)) {
+    logger.warn('rollback skipped: migration not applied', { target });
+    return null;
+  }
+  const upFile = path.join(MIGRATIONS_DIR, target);
+  const downFile = upFile.replace(/\.sql$/, '.down.sql');
+  if (!existsSync(downFile)) {
+    logger.warn('rollback unavailable: missing down script', { target });
+    return null;
+  }
+  const sql = readFileSync(downFile, 'utf8');
+  const tx = sqlite.transaction(() => {
+    sqlite.exec(sql);
+    sqlite.prepare('DELETE FROM _migrations WHERE name = ?').run(target);
+  });
+  tx();
+  logger.info('migration rolled back', { file: target });
+  return target;
+}
+
 if (import.meta.url === `file://${process.argv[1]}`) {
-  runMigrations();
+  const rollbackArg = process.argv.includes('--rollback');
+  if (rollbackArg) {
+    const idx = process.argv.indexOf('--rollback');
+    const name = process.argv[idx + 1];
+    rollback(name && name.endsWith('.sql') ? name : undefined);
+  } else {
+    runMigrations();
+  }
 }

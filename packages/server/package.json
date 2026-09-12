@@ -12,12 +12,15 @@
     "test": "node --test --experimental-transform-types \"src/**/*.test.ts\" \"test/**/*.test.ts\"",
     "lint": "tsc --noEmit",
     "db:generate": "drizzle-kit generate",
-    "db:migrate": "tsx src/db/migrate.ts"
+    "db:migrate": "tsx src/db/migrate.ts",
+    "perf:million": "tsx scripts/perf-million-tokens.ts",
+    "test:context": "node --test --experimental-transform-types \"src/context/**/*.test.ts\"",
+    "db:rollback": "tsx src/db/migrate.ts --rollback"
   },
   "dependencies": {
     "@ai/shared": "workspace:*",
     "@hono/node-server": "^1.13.7",
-    "better-sqlite3": "^11.5.0",
+    "better-sqlite3": "^13.0.3",
     "docx": "^9.0.3",
     "drizzle-orm": "^0.36.4",
     "exceljs": "^4.4.0",

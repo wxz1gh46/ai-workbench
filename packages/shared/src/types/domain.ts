@@ -1,3 +1,4 @@
+import type { OfficeFormat } from './api.ts';
 import type { Id, IsoDateTime } from './ids.ts';
 
 /* ------------------------------------------------------------------ */
@@ -457,5 +458,322 @@ export interface AuditLog {
   dangerous: boolean;
   confirmedByUser: boolean;
   detail: Record<string, unknown>;
+  createdAt: IsoDateTime;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2：百万 Token 分层上下文                                       */
+/* ------------------------------------------------------------------ */
+
+/** 上下文片段种类：对应 Token 预算的五个分区 */
+export type ContextBlockKind = 'summary' | 'facts' | 'recent' | 'retrieval' | 'file' | 'goal';
+
+export interface ContextBlock {
+  kind: ContextBlockKind;
+  content: string;
+  /** 溯源：该片段来自哪些 messageId / factId，前端可点击跳回原消息 */
+  sourceIds: Id[];
+  tokens: number;
+  /** 片段级相关度（向量召回时给出），用于 UI 排序展示 */
+  score?: number;
+}
+
+/** Token 预算分配结果，UI 用进度条展示 */
+export interface TokenBudgetUsage {
+  total: number;
+  used: number;
+  byKind: Record<ContextBlockKind, number>;
+  /** 各分区上限 */
+  limits: Record<ContextBlockKind, number>;
+  outputReserve: number;
+  overBudget: boolean;
+}
+
+/** 上下文组装结果（可溯源） */
+export interface ContextBundle {
+  blocks: ContextBlock[];
+  totalTokens: number;
+  /** 全部可溯源 messageId，前端高亮用 */
+  citations: Id[];
+  budget: TokenBudgetUsage;
+  /** 当前路由到的模型 */
+  model: string;
+  /** 模型是否因长上下文自动切换 */
+  routedByLength: boolean;
+}
+
+/** 长期记忆事实（Phase 2 增加 embedding、分类与召回计数） */
+export interface MemoryFactRecord extends MemoryFact {
+  /** 向量（本地确定性 embedding 或外部服务返回），null 表示尚未计算 */
+  embedding: number[] | null;
+  /** 被检索召回次数，用于重要度衰减/提升 */
+  recallCount: number;
+  /** 事实分类 */
+  factType: 'preference' | 'constraint' | 'decision' | 'fact';
+  updatedAt: IsoDateTime;
+}
+
+/** 会话压缩（滚动摘要）执行结果 */
+export interface CompactResult {
+  conversationId: Id;
+  summarizedMessages: number;
+  summaryId: Id | null;
+  summary: string;
+  tokensBefore: number;
+  tokensAfter: number;
+  factsExtracted: number;
+  degraded: boolean;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2：目标模式（GoalRun / 进度树）                                */
+/* ------------------------------------------------------------------ */
+
+export type GoalRunStatus = 'running' | 'succeeded' | 'failed' | 'cancelled';
+
+/** 一次目标推进的持久化记录，支持回放与审计 */
+export interface GoalRun {
+  id: Id;
+  goalId: Id;
+  iteration: number;
+  status: GoalRunStatus;
+  /** 本轮使用的计划（JSON） */
+  plan: Record<string, unknown> | null;
+  /** 本轮反思结论 */
+  reflection: string;
+  /** 本轮审计报告 */
+  auditReport: string | null;
+  taskIds: Id[];
+  tokensUsed: number;
+  startedAt: IsoDateTime;
+  finishedAt: IsoDateTime | null;
+}
+
+/** 进度树节点：目标 → 任务 → 子任务 */
+export interface ProgressNode {
+  id: Id;
+  parentId: Id | null;
+  title: string;
+  status: TaskStatus | GoalStatus;
+  progress: number;
+  agentRole: string;
+  assigneeAgentId: Id | null;
+  dependsOn: Id[];
+  children: ProgressNode[];
+  /** 阻塞原因（status=blocked 时） */
+  blockedReason: string | null;
+  outputSummary: string | null;
+}
+
+export interface ProgressTree {
+  goal: {
+    id: Id;
+    objective: string;
+    status: GoalStatus;
+    progress: number;
+    iterations: number;
+    maxIterations: number;
+    acceptanceCriteria: string[];
+  };
+  nodes: ProgressNode[];
+  /** 完成度总览 */
+  summary: {
+    total: number;
+    succeeded: number;
+    failed: number;
+    blocked: number;
+    running: number;
+    pending: number;
+    percent: number;
+  };
+  blockers: string[];
+}
+
+/** 完成审计报告（结构化，便于 UI 渲染） */
+export interface AuditReport {
+  goalId: Id;
+  passed: boolean;
+  score: number;
+  criteria: { criterion: string; met: boolean; evidence: string }[];
+  issues: { severity: 'low' | 'medium' | 'high'; detail: string }[];
+  nextActions: string[];
+  markdown: string;
+  degraded: boolean;
+  generatedAt: IsoDateTime;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2：多 Agent 集群                                               */
+/* ------------------------------------------------------------------ */
+
+/** Agent 集群运行模式：实验性集群可降级为单 Agent */
+export type ClusterMode = 'single' | 'parallel' | 'cluster';
+
+export interface ClusterConfig {
+  workspaceId: Id;
+  mode: ClusterMode;
+  /** 并发上限 */
+  maxParallel: number;
+  /** 集群节点标识（跨机部署时使用，本地为 'local'） */
+  nodeId: string;
+  /** 功能开关：出问题时一键关闭实验性能力 */
+  experimental: boolean;
+}
+
+/** 任务看板列 */
+export type TaskBoardColumn = 'todo' | 'running' | 'blocked' | 'done';
+
+export interface TaskBoardCard {
+  taskId: Id;
+  goalId: Id;
+  title: string;
+  column: TaskBoardColumn;
+  status: TaskStatus;
+  agentRole: string;
+  assigneeAgentId: Id | null;
+  assigneeName: string | null;
+  attempts: number;
+  maxAttempts: number;
+  dependsOn: Id[];
+  blockedReason: string | null;
+  tokensUsed: number;
+  updatedAt: IsoDateTime;
+}
+
+export interface TaskBoard {
+  columns: Record<TaskBoardColumn, TaskBoardCard[]>;
+  total: number;
+}
+
+/** Agent 间消息（Phase 2 扩展：可寻址、可回复） */
+export interface AgentMessageRecord extends AgentMessage {
+  /** 会话线程标识，便于 UI 按话题聚合 */
+  threadId: Id;
+  /** 消息种类 */
+  kind: 'broadcast' | 'direct' | 'task-claim' | 'task-result' | 'request-help' | 'reply';
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2：Office 文件处理                                             */
+/* ------------------------------------------------------------------ */
+
+export interface OfficeDocumentInfo {
+  fileId: Id | null;
+  path: string;
+  format: OfficeFormat;
+  /** docx: 段落；xlsx: 工作表；pptx: 幻灯片；pdf: 页文本 */
+  meta: {
+    paragraphs?: number;
+    sheets?: { name: string; rows: number; cols: number }[];
+    slides?: number;
+    pages?: number;
+    words?: number;
+  };
+  /** 解析出的结构化内容（文本 + 表格 + 幻灯片） */
+  content: OfficeContent;
+  /** 解析过程中的降级说明（如 PDF 中文排版） */
+  warnings: string[];
+}
+
+export interface OfficeContent {
+  text: string;
+  tables?: { sheet: string; rows: (string | number | boolean | null)[][] }[];
+  slides?: { title: string; bullets: string[] }[];
+  outline?: { level: number; text: string }[];
+}
+
+/** Office 预览（供 UI 渲染，不依赖原生 Office） */
+export interface OfficePreview {
+  format: OfficeFormat;
+  /** markdown 形式的结构化预览 */
+  markdown: string;
+  tables: { sheet: string; rows: (string | number | boolean | null)[][] }[];
+  slides: { title: string; bullets: string[] }[];
+  /** 是否需要专用渲染器（docx 用 docx-preview、pdf 用 pdf.js） */
+  renderer: 'markdown' | 'docx-preview' | 'pdf.js' | 'sheetjs' | 'pptx';
+  /** 可下载 URL */
+  downloadUrl: string;
+}
+
+/* ------------------------------------------------------------------ */
+/* Phase 2：深度研究                                                    */
+/* ------------------------------------------------------------------ */
+
+export type ResearchJobStatus =
+  | 'pending'
+  | 'searching'
+  | 'fetching'
+  | 'extracting'
+  | 'validating'
+  | 'analyzing'
+  | 'writing'
+  | 'completed'
+  | 'failed'
+  | 'cancelled';
+
+export interface ResearchSource {
+  id: Id;
+  researchJobId: Id;
+  url: string;
+  title: string;
+  snippet: string;
+  /** 抓取到的正文（截断存储） */
+  content: string;
+  accessedAt: IsoDateTime;
+  /** 可信度 0-1，由来源域名与交叉验证结果推断 */
+  reliability: number;
+  /** 是否为付费/需登录来源，未授权时标记为未验证 */
+  requiresAuth: boolean;
+}
+
+export interface ResearchClaim {
+  id: Id;
+  researchJobId: Id;
+  claim: string;
+  /** 支持该论断的来源 id */
+  supportingSources: Id[];
+  /** 冲突来源 id（多源交叉验证发现不一致） */
+  conflictingSources: Id[];
+  confidence: number;
+  /** 是否被标记为冲突 */
+  disputed: boolean;
+}
+
+export interface ResearchJob {
+  id: Id;
+  workspaceId: Id;
+  topic: string;
+  depth: 'quick' | 'standard' | 'deep';
+  status: ResearchJobStatus;
+  /** 生成的检索式 */
+  queries: string[];
+  progress: number;
+  stage: string;
+  sourceCount: number;
+  claimCount: number;
+  disputedCount: number;
+  error: string | null;
+  createdAt: IsoDateTime;
+  finishedAt: IsoDateTime | null;
+}
+
+export interface ResearchReport {
+  id: Id;
+  researchJobId: Id;
+  markdown: string;
+  /** 图表（Mermaid / SVG，前端可直接渲染） */
+  charts: { title: string; kind: 'bar' | 'line' | 'pie' | 'mermaid'; data: unknown }[];
+  references: {
+    index: number;
+    sourceId: Id;
+    title: string;
+    url: string;
+    accessedAt: IsoDateTime;
+    snippet: string;
+  }[];
+  markdownPath: string | null;
+  pdfPath: string | null;
+  pptxPath: string | null;
+  webUrl: string | null;
   createdAt: IsoDateTime;
 }
