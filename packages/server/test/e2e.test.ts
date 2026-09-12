@@ -53,7 +53,12 @@ test('health 暴露降级状态与特性开关', async () => {
   assert.equal(res.status, 200);
   assert.equal(body.ok, true);
   assert.equal(body.data.degraded, true); // 测试环境未配置 AI_API_KEY
-  assert.equal(body.data.features.phase4PaidPlugins, false);
+  // Phase 4 开关默认开启（Phase 3 的 Phase 1/2 未实现开关已不再使用）；
+  // 开关的作用是「可单独关闭且数据保留」，因此这里断言它存在且为 boolean。
+  assert.equal(typeof body.data.features.phase4PaidPlugins, 'boolean');
+  assert.equal(body.data.features.phase4Cluster, true);
+  assert.equal(body.data.features.phase4Prompt, true);
+  assert.equal(body.data.features.phase4Enterprise, true);
 });
 
 let goalId = '';

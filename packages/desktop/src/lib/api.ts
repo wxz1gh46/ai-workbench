@@ -46,6 +46,40 @@ import type {
   ScheduleRunRecord,
   NotifyChannel,
   NotifyLogRecord,
+  /* Phase 4 */
+  PluginManifestV4,
+  PluginInstallationInfo,
+  PluginInvokeResult,
+  McpServerRecord,
+  McpToolRecord,
+  PaidDataProviderSpec,
+  PaidDataCredentialInfo,
+  PaidDataQueryRecord,
+  PaidDataQueryResult,
+  PaidDataCitation,
+  PromptVariableSpec,
+  PromptABTestInfo,
+  PromptABTestReport,
+  PromptEvaluationInfo,
+  PromptOptimizeReport,
+  ClusterNodeInfo,
+  ClusterStatus,
+  ClusterPolicyInfo,
+  ClusterTaskInfo,
+  ClusterShardInfo,
+  ElectionRecord,
+  AgentPoolInfo,
+  AgentRouteInfo,
+  AggregatedResultInfo,
+  CostRecordInfo,
+  CostSummary,
+  RoleInfo,
+  UserRoleInfo,
+  SsoConfigInfo,
+  AuditExportInfo,
+  DataMaskRuleInfo,
+  RetentionPolicyInfo,
+  RetentionRunResult,
 } from '@ai/shared';
 
 /**
@@ -486,6 +520,405 @@ export const api = {
     request<{ logs: NotifyLogRecord[] }>(
       `/notify/logs?workspaceId=${encodeURIComponent(workspaceId)}&limit=${limit}${channelId ? `&channelId=${encodeURIComponent(channelId)}` : ''}`,
     ),
+
+  /* ================================================================== */
+  /* Phase 4：插件系统与 MCP                                             */
+  /* ================================================================== */
+
+  pluginMarket: (params: { q?: string; kind?: string; requiresAuth?: boolean } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.q) qs.set('q', params.q);
+    if (params.kind) qs.set('kind', params.kind);
+    if (params.requiresAuth !== undefined) qs.set('requiresAuth', String(params.requiresAuth));
+    return request<{ catalog: PluginManifestV4[]; kinds: string[] }>(`/plugins/market?${qs.toString()}`);
+  },
+  pluginDetail: (name: string) =>
+    request<{ manifest: PluginManifestV4; signature: { signed: boolean; ok: boolean; hash: string }; marketSize: number }>(
+      `/plugins/market/${encodeURIComponent(name)}`,
+    ),
+  listInstalledPlugins: (workspaceId: string) =>
+    request<{ plugins: PluginInstallationInfo[] }>(`/plugins/installed?workspaceId=${encodeURIComponent(workspaceId)}`),
+  installPluginV4: (name: string, workspaceId: string) =>
+    request<PluginInstallationInfo & { installationId: string; pluginId: string }>(
+      `/plugins/install?name=${encodeURIComponent(name)}&confirm=true`,
+      { method: 'POST', body: JSON.stringify({ workspaceId }) },
+    ),
+  uninstallPluginV4: (pluginId: string, workspaceId: string) =>
+    request<{ removed: string; name: string }>(`/plugins/${encodeURIComponent(pluginId)}/uninstall?confirm=true`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId }),
+    }),
+  updatePluginV4: (pluginId: string, workspaceId: string) =>
+    request<PluginInstallationInfo & { previousVersion: string; updated: boolean; latest: string }>(
+      `/plugins/${encodeURIComponent(pluginId)}/update`,
+      { method: 'POST', body: JSON.stringify({ workspaceId }) },
+    ),
+  pluginPermissions: (pluginId: string, workspaceId: string) =>
+    request<{
+      installationId: string;
+      permissions: (PluginInstallationInfo['permissions'][number])[];
+      grantedScopes: string[];
+      requiresUserAuth: boolean;
+      secretRefs: string[];
+    }>(`/plugins/${encodeURIComponent(pluginId)}/permissions?workspaceId=${encodeURIComponent(workspaceId)}`),
+  grantPlugin: (installationId: string, workspaceId: string, scopes: string[], expiresAt?: string | null) =>
+    request<{ granted: string[]; grantedScopes: string[] }>(`/plugins/${encodeURIComponent(installationId)}/grant`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, scopes, expiresAt: expiresAt ?? null }),
+    }),
+  revokePlugin: (installationId: string, workspaceId: string, scopes?: string[]) =>
+    request<{ revoked: string[]; grantedScopes: string[] }>(
+      `/plugins/${encodeURIComponent(installationId)}/revoke?confirm=true`,
+      { method: 'POST', body: JSON.stringify({ workspaceId, ...(scopes ? { scopes } : {}) }) },
+    ),
+  invokePlugin: (installationId: string, workspaceId: string, tool: string, args: Record<string, unknown> = {}, confirm = false) =>
+    request<PluginInvokeResult>(`/plugins/${encodeURIComponent(installationId)}/invoke`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, tool, args, confirm }),
+    }),
+  pluginCalls: (installationId: string, workspaceId: string, limit = 100) =>
+    request<{ calls: { id: string; tool: string; args: Record<string, unknown>; ok: boolean; durationMs: number; error: string | null; createdAt: string }[] }>(
+      `/plugins/${encodeURIComponent(installationId)}/calls?workspaceId=${encodeURIComponent(workspaceId)}&limit=${limit}`,
+    ),
+  listMcpServers: (workspaceId: string) =>
+    request<{ servers: McpServerRecord[]; transports: string[] }>(`/mcp/servers?workspaceId=${encodeURIComponent(workspaceId)}`),
+  registerMcpServer: (input: {
+    workspaceId: string;
+    name: string;
+    transport?: string;
+    endpoint?: string;
+    command?: string;
+    args?: string[];
+    secretRefs?: string[];
+  }) => request<{ server: McpServerRecord }>('/mcp/servers?confirm=true', { method: 'POST', body: JSON.stringify(input) }),
+  removeMcpServer: (id: string, workspaceId: string) =>
+    request<{ removed: string }>(`/mcp/servers/${encodeURIComponent(id)}?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`, {
+      method: 'DELETE',
+    }),
+  syncMcpServer: (id: string, workspaceId: string) =>
+    request<{ synced: number; degraded: boolean; note?: string; tools: McpToolRecord[] }>(
+      `/mcp/servers/${encodeURIComponent(id)}/sync?workspaceId=${encodeURIComponent(workspaceId)}`,
+      { method: 'POST', body: '{}' },
+    ),
+  mcpTools: (id: string, workspaceId: string) =>
+    request<{ tools: McpToolRecord[] }>(`/mcp/servers/${encodeURIComponent(id)}/tools?workspaceId=${encodeURIComponent(workspaceId)}`),
+
+  /* ================================================================== */
+  /* Phase 4：付费数据库                                                 */
+  /* ================================================================== */
+
+  paidProviders: (workspaceId?: string) =>
+    request<{ providers: PaidDataProviderSpec[]; disclaimer?: string }>(
+      `/paid-data/providers${workspaceId ? `?workspaceId=${encodeURIComponent(workspaceId)}` : ''}`,
+    ),
+  listPaidCredentials: (workspaceId: string) =>
+    request<{ credentials: PaidDataCredentialInfo[]; requiredFields: Record<string, string[]> }>(
+      `/paid-data/credentials?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+  savePaidCredential: (providerId: string, workspaceId: string, credentials: Record<string, string>, replace = false) =>
+    request<{ providerId: string; status: string; fieldNames: string[]; requiredMissing: string[]; masked: Record<string, string> }>(
+      `/paid-data/credentials?providerId=${encodeURIComponent(providerId)}&confirm=true`,
+      { method: 'POST', body: JSON.stringify({ workspaceId, credentials, replace }) },
+    ),
+  removePaidCredential: (providerId: string, workspaceId: string) =>
+    request<{ removed: string }>(
+      `/paid-data/credentials/${encodeURIComponent(providerId)}?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`,
+      { method: 'DELETE' },
+    ),
+  paidPreflight: (input: { workspaceId: string; providerId: string; action: string; params?: Record<string, unknown> }) =>
+    request<{ allowed: boolean; reason?: string; code?: string; accessMethods: string[]; rateLimit: { perMinute: number; note: string } }>(
+      '/paid-data/preflight',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  paidQuery: (input: { workspaceId: string; providerId: string; action: string; params?: Record<string, unknown>; noCache?: boolean; purpose?: string }) =>
+    request<PaidDataQueryResult & { queryId: string; providerId: string; action: string; status: string; data: unknown; citations: PaidDataCitation[]; cached: boolean; degraded: boolean; note?: string; blockedReason?: string; rowCount: number; durationMs: number }>(
+      '/paid-data/query?confirm=true',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  listPaidQueries: (workspaceId: string, limit = 50) =>
+    request<{ queries: PaidDataQueryRecord[] }>(`/paid-data/queries?workspaceId=${encodeURIComponent(workspaceId)}&limit=${limit}`),
+  getPaidQuery: (id: string, workspaceId: string) =>
+    request<{ query: PaidDataQueryRecord; result: { data: unknown; citations: PaidDataCitation[] } | null }>(
+      `/paid-data/queries/${encodeURIComponent(id)}?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+
+  /* ================================================================== */
+  /* Phase 4：提示词工作台                                               */
+  /* ================================================================== */
+
+  promptLibrary: () =>
+    request<{ templates: { key: string; name: string; description: string; tags: string[]; sections: PromptSections; variables: PromptVariableSpec[]; filledSections: number }[] }>(
+      '/prompts/library',
+    ),
+  useLibraryTemplate: (key: string, workspaceId: string, name?: string) =>
+    request<{ templateId: string; name: string; version: number; sections: PromptSections; variables: PromptVariableSpec[] }>(
+      `/prompts/library/${encodeURIComponent(key)}`,
+      { method: 'POST', body: JSON.stringify({ workspaceId, ...(name ? { name } : {}) }) },
+    ),
+  promptMetrics: () =>
+    request<{ metrics: { manual: { metric: string; label: string; range: [number, number] }[]; auto: { metric: string; label: string; range: [number, number] }[] } }>('/prompts/catalog'),
+  listPromptsV4: (workspaceId: string) =>
+    request<{ templates: { name: string; latestId: string; version: number; versions: number[]; sections: PromptSections; variables: string[]; tags: string[]; updatedAt: string; score: number }[] }>(
+      `/prompts/v4?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+  getPromptV4: (name: string, workspaceId: string, version?: number) =>
+    request<{
+      name: string;
+      version: number;
+      templateId: string;
+      sections: PromptSections;
+      variables: PromptVariableSpec[];
+      history: { id: string; version: number; updatedAt: string; score: number }[];
+      score: number;
+      renders: { markdown: string; ok: boolean; missingRequired: string[] };
+    }>(`/prompts/v4/${encodeURIComponent(name)}?workspaceId=${encodeURIComponent(workspaceId)}${version ? `&version=${version}` : ''}`),
+  generatePromptV4: (input: { workspaceId: string; goal: string; context?: string; targetModel?: string; useModel?: boolean }) =>
+    request<{ sections: PromptSections; rendered: string; variables: PromptVariableSpec[]; intent: string; notes: string[]; degraded: boolean }>(
+      '/prompts/generate',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  optimizePromptV4: (input: { workspaceId: string; current: Partial<PromptSections>; intent?: string; targetModel?: string; useModel?: boolean }) =>
+    request<PromptOptimizeReport & { rendered: string }>('/prompts/optimize-v4', { method: 'POST', body: JSON.stringify(input) }),
+  copyPrompt: (sections: Partial<PromptSections>, variables: Record<string, string> = {}, name = '提示词') =>
+    request<{ markdown: string; rendered: string; missingRequired: string[]; unknownVariables: string[]; ok: boolean }>('/prompts/copy', {
+      method: 'POST',
+      body: JSON.stringify({ sections, variables, name }),
+    }),
+  savePromptV4: (input: { workspaceId: string; name: string; sections: Partial<PromptSections>; tags?: string[] }) =>
+    request<{ templateId: string; name: string; version: number }>('/prompts/v4', { method: 'POST', body: JSON.stringify(input) }),
+  rollbackPromptV4: (name: string, workspaceId: string, version: number) =>
+    request<{ templateId: string; name: string; version: number }>(
+      `/prompts/v4/${encodeURIComponent(name)}/rollback?confirm=true`,
+      { method: 'POST', body: JSON.stringify({ workspaceId, version }) },
+    ),
+  createAbTest: (input: { workspaceId: string; templateName: string; versionA: number; versionB: number; name?: string }) =>
+    request<{ id: string; templateName: string; versionA: number; versionB: number; status: string }>('/prompts/v4/abtest', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  listAbTests: (workspaceId: string) => request<{ tests: PromptABTestInfo[] }>(`/prompts/abtests?workspaceId=${encodeURIComponent(workspaceId)}`),
+  recordAbEvaluation: (id: string, input: { workspaceId: string; version: 'A' | 'B'; metric: string; value: number; sampleSize: number; note?: string }) =>
+    request<PromptEvaluationInfo>(`/prompts/abtests/${encodeURIComponent(id)}/evaluate`, { method: 'POST', body: JSON.stringify(input) }),
+  autoEvaluateAb: (id: string, workspaceId: string) =>
+    request<{ abTestId: string; results: { version: string; metrics: { metric: string; value: number }[] }[] }>(
+      `/prompts/abtests/${encodeURIComponent(id)}/auto-evaluate?workspaceId=${encodeURIComponent(workspaceId)}`,
+      { method: 'POST', body: '{}' },
+    ),
+  getAbTest: (id: string, workspaceId: string) =>
+    request<PromptABTestReport>(`/prompts/abtests/${encodeURIComponent(id)}?workspaceId=${encodeURIComponent(workspaceId)}`),
+  finishAbTest: (id: string, workspaceId: string) =>
+    request<PromptABTestReport>(`/prompts/abtests/${encodeURIComponent(id)}/finish?workspaceId=${encodeURIComponent(workspaceId)}`, {
+      method: 'POST',
+      body: '{}',
+    }),
+
+  /* ================================================================== */
+  /* Phase 4：集群视图                                                   */
+  /* ================================================================== */
+
+  clusterNodes: (workspaceId: string) =>
+    request<{ nodes: (ClusterNodeInfo & { metrics: { cpu: number; memory: number; gpu: number; disk: number; network: number } | null })[]; policy: ClusterPolicyInfo }>(
+      `/cluster/nodes?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+  registerClusterNode: (input: { workspaceId: string; name: string; role?: string; host?: string; port?: number; resources?: Record<string, number>; labels?: Record<string, string> }) =>
+    request<{ node: ClusterNodeInfo }>('/cluster/nodes', { method: 'POST', body: JSON.stringify(input) }),
+  removeClusterNode: (id: string, workspaceId: string) =>
+    request<{ removed: string; name: string }>(`/cluster/nodes/${encodeURIComponent(id)}?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`, {
+      method: 'DELETE',
+    }),
+  clusterHeartbeat: (id: string, metrics: { cpu?: number; memory?: number } = {}) =>
+    request<{ node: ClusterNodeInfo }>(`/cluster/nodes/${encodeURIComponent(id)}/heartbeat`, { method: 'POST', body: JSON.stringify(metrics) }),
+  clusterSweep: (workspaceId: string) =>
+    request<{ offline: { id: string; name: string }[]; online: { id: string; name: string }[] }>(
+      `/cluster/sweep?workspaceId=${encodeURIComponent(workspaceId)}`,
+      { method: 'POST', body: '{}' },
+    ),
+  clusterStatus: (workspaceId: string, mode = 'cluster') =>
+    request<ClusterStatus>(`/cluster/status?workspaceId=${encodeURIComponent(workspaceId)}&mode=${mode}`),
+  clusterHealth: () =>
+    request<{ nodes: { id: string; name: string; role: string; status: string; lastHeartbeat: string | null; heartbeatMiss: number; metrics: { cpu: number; memory: number; gpu: number; disk: number; network: number } | null }[]; online: number; total: number }>(
+      '/cluster/health',
+    ),
+  clusterElections: (workspaceId: string) =>
+    request<{ elections: ElectionRecord[]; term: number }>(`/cluster/elections?workspaceId=${encodeURIComponent(workspaceId)}`),
+  forceElection: (workspaceId: string) =>
+    request<{ term: number; leaderNodeId: string; reason: string; changed: boolean }>(
+      `/cluster/elections?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`,
+      { method: 'POST', body: '{}' },
+    ),
+  clusterTasks: (workspaceId: string, limit = 100) =>
+    request<{ tasks: ClusterTaskInfo[] }>(`/cluster/tasks?workspaceId=${encodeURIComponent(workspaceId)}&limit=${limit}`),
+  distributeClusterTask: (input: { workspaceId: string; taskId: string; items: unknown[]; shardCount?: number; goalId?: string; labels?: Record<string, string>; need?: Record<string, number> }) =>
+    request<{ assignments: { shardIndex: number; nodeId: string; nodeName: string; reason: string }[]; skipped: { shardIndex: number; reason: string }[] }>(
+      '/cluster/tasks/distribute',
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  cancelClusterTask: (id: string, workspaceId: string) =>
+    request<{ task: ClusterTaskInfo }>(`/cluster/tasks/${encodeURIComponent(id)}/cancel?workspaceId=${encodeURIComponent(workspaceId)}`, {
+      method: 'POST',
+      body: '{}',
+    }),
+  clusterPolicy: (workspaceId: string) =>
+    request<{ policy: ClusterPolicyInfo }>(`/cluster/policy?workspaceId=${encodeURIComponent(workspaceId)}`),
+  updateClusterPolicy: (workspaceId: string, patch: Partial<{ maxNodes: number; maxParallelTasks: number; fallbackEnabled: boolean; heartbeatTimeoutMs: number; resourceLimits: Record<string, number> }>) =>
+    request<{ policy: ClusterPolicyInfo }>(`/cluster/policy?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`, {
+      method: 'PATCH',
+      body: JSON.stringify({ workspaceId, ...patch }),
+    }),
+  clusterBootstrap: (workspaceId: string) =>
+    request<{ nodeId: string; elected: boolean; term: number }>('/cluster/bootstrap', { method: 'POST', body: JSON.stringify({ workspaceId }) }),
+
+  /* ================================================================== */
+  /* Phase 4：Agent 池 / 路由 / 成本                                     */
+  /* ================================================================== */
+
+  agentPools: (workspaceId: string) =>
+    request<{ pools: (AgentPoolInfo & { busy: number; headroom: number })[] }>(`/agents/pool?workspaceId=${encodeURIComponent(workspaceId)}`),
+  createAgentPool: (input: { workspaceId: string; name: string; role: string; minAgents?: number; maxAgents?: number; tools?: string[] }) =>
+    request<{ pool: AgentPoolInfo }>('/agents/pool', { method: 'POST', body: JSON.stringify(input) }),
+  scaleAgentPool: (role: string, workspaceId: string, target: number) =>
+    request<{ pool: AgentPoolInfo; changed: number; reason: string }>(`/agents/pool/scale?role=${encodeURIComponent(role)}&confirm=true`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, target }),
+    }),
+  agentRoutes: (params: { taskId?: string; limit?: number } = {}) => {
+    const qs = new URLSearchParams();
+    if (params.taskId) qs.set('taskId', params.taskId);
+    if (params.limit) qs.set('limit', String(params.limit));
+    return request<{ routes: AgentRouteInfo[] }>(`/agents/routes?${qs.toString()}`);
+  },
+  agentModels: () =>
+    request<{ models: { model: string; inputPricePerM: number; outputPricePerM: number }[] }>('/agents/models'),
+  orchestrate: (input: {
+    workspaceId: string;
+    goalId?: string;
+    nodes: { id: string; dependsOn: string[]; status: string; title?: string; priority?: number }[];
+    taskTexts?: Record<string, string>;
+    taskKinds?: Record<string, string>;
+    networkAllowed?: boolean;
+    maxParallel?: number;
+    aggregationStrategy?: string;
+    dryRun?: boolean;
+  }) =>
+    request<{
+      parallelism: { limit: number; reason: string; factors: { name: string; value: number }[] };
+      batches: string[][];
+      dispatched: { taskId: string; role: string; model: string; tools: string[]; routeReason: string; agentReason: string }[];
+      waiting: { taskId: string; reason: string }[];
+      completed: string[];
+      failed: { taskId: string; error: string }[];
+      aggregated: AggregatedResultInfo[];
+      cost: { total: number; state: string; ratio: number };
+      speedup: { sequentialMs: number; parallelMs: number; speedup: number; batches: number };
+      notes: string[];
+    }>('/agents/orchestrate', { method: 'POST', body: JSON.stringify(input) }),
+  aggregatedResults: (taskId: string) => request<{ results: AggregatedResultInfo[] }>(`/aggregated/results?taskId=${encodeURIComponent(taskId)}`),
+  resolveAggregated: (id: string, workspaceId: string, decisions: { key: string; agentId?: string; value?: unknown }[]) =>
+    request<{ id: string; remaining: number; needsReview: boolean; resolvedAt: string | null }>(
+      `/aggregated/${encodeURIComponent(id)}/resolve?confirm=true`,
+      { method: 'POST', body: JSON.stringify({ workspaceId, decisions }) },
+    ),
+  costs: (workspaceId: string, goalId?: string) =>
+    request<CostSummary & { goalId?: string; cost?: number; records?: number }>(
+      `/costs?workspaceId=${encodeURIComponent(workspaceId)}${goalId ? `&goalId=${encodeURIComponent(goalId)}` : ''}`,
+    ),
+  recordCost: (input: { workspaceId: string; model: string; tokensIn: number; tokensOut: number; goalId?: string; taskId?: string; agentId?: string; costUsd?: number }) =>
+    request<{ id: string; cost: number; total: number; state: string; ratio: number }>('/costs', { method: 'POST', body: JSON.stringify(input) }),
+
+  /* ================================================================== */
+  /* Phase 4：安全中心                                                   */
+  /* ================================================================== */
+
+  rbacPermissions: () =>
+    request<{ permissions: { key: string; label: string }[]; all: string[] }>('/rbac/permissions'),
+  listRoles: (workspaceId: string) => request<{ roles: RoleInfo[] }>(`/rbac/roles?workspaceId=${encodeURIComponent(workspaceId)}`),
+  createRole: (input: { workspaceId: string; name: string; permissions: string[] }) =>
+    request<{ role: RoleInfo }>('/rbac/roles', { method: 'POST', body: JSON.stringify(input) }),
+  updateRole: (name: string, workspaceId: string, permissions: string[]) =>
+    request<{ role: RoleInfo }>(`/rbac/roles/${encodeURIComponent(name)}`, { method: 'PATCH', body: JSON.stringify({ workspaceId, permissions }) }),
+  deleteRole: (name: string, workspaceId: string) =>
+    request<{ removed: string; name: string }>(`/rbac/roles/${encodeURIComponent(name)}?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`, {
+      method: 'DELETE',
+    }),
+  assignRole: (workspaceId: string, userId: string, role: string) =>
+    request<{ assigned: boolean; role: string; userId: string; permissions: string[] }>('/rbac/assign?confirm=true', {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, userId, role }),
+    }),
+  unassignRole: (workspaceId: string, userId: string, role: string) =>
+    request<{ unassigned: boolean; role: string; userId: string }>('/rbac/unassign', { method: 'POST', body: JSON.stringify({ workspaceId, userId, role }) }),
+  rbacUsers: (workspaceId: string) =>
+    request<{ users: { userId: string; roles: string[]; permissions: string[] }[] }>(`/rbac/users?workspaceId=${encodeURIComponent(workspaceId)}`),
+  checkPermission: (workspaceId: string, userId: string, permission: string) =>
+    request<{ allowed: boolean; reason: string; granted: string[] }>(
+      `/rbac/check?workspaceId=${encodeURIComponent(workspaceId)}&userId=${encodeURIComponent(userId)}&permission=${encodeURIComponent(permission)}`,
+    ),
+  ssoConfig: (workspaceId: string) => request<SsoConfigInfo & { configured: boolean; hasSecret: boolean }>(`/sso/config?workspaceId=${encodeURIComponent(workspaceId)}`),
+  saveSsoConfig: (input: { workspaceId: string; protocol?: string; issuer: string; clientId: string; clientSecretRef: string; redirectUri: string; groupMapping?: Record<string, string>; enabled?: boolean }) =>
+    request<SsoConfigInfo & { configured: boolean; hasSecret: boolean }>('/sso/config', { method: 'POST', body: JSON.stringify(input) }),
+  enableSso: (workspaceId: string, enabled: boolean) =>
+    request<SsoConfigInfo & { configured: boolean; hasSecret: boolean }>(`/sso/enable?confirm=true`, {
+      method: 'POST',
+      body: JSON.stringify({ workspaceId, enabled }),
+    }),
+  removeSso: (workspaceId: string) =>
+    request<{ removed: boolean }>(`/sso/config?workspaceId=${encodeURIComponent(workspaceId)}&confirm=true`, { method: 'DELETE' }),
+  ssoAuthUrl: (workspaceId: string) =>
+    request<{ url: string; state: string; nonce: string; expiresAt: string }>(`/sso/auth-url?workspaceId=${encodeURIComponent(workspaceId)}`),
+  auditLogs: (params: { workspaceId: string; from?: string; to?: string; action?: string; actor?: string; dangerousOnly?: boolean; limit?: number }) => {
+    const qs = new URLSearchParams({ workspaceId: params.workspaceId });
+    if (params.from) qs.set('from', params.from);
+    if (params.to) qs.set('to', params.to);
+    if (params.action) qs.set('action', params.action);
+    if (params.actor) qs.set('actor', params.actor);
+    if (params.dangerousOnly) qs.set('dangerousOnly', 'true');
+    if (params.limit) qs.set('limit', String(params.limit));
+    return request<{ logs: AuditLog[]; stats: { total: number; dangerous: number; unconfirmedDangerous: number; byAction: { action: string; count: number }[]; byActor: { actor: string; count: number }[] } }>(
+      `/audit/logs?${qs.toString()}`,
+    );
+  },
+  exportAudit: (input: { workspaceId: string; from: string; to: string; actor?: string }) =>
+    request<{ exportId: string; filePath: string; rowCount: number; bytes: number }>('/audit/export?confirm=true', {
+      method: 'POST',
+      body: JSON.stringify(input),
+    }),
+  auditExports: (workspaceId: string) => request<{ exports: AuditExportInfo[] }>(`/audit/exports?workspaceId=${encodeURIComponent(workspaceId)}`),
+  auditExportDownloadUrl: (id: string, workspaceId: string) =>
+    `${BASE}/audit/exports/${encodeURIComponent(id)}/download?workspaceId=${encodeURIComponent(workspaceId)}`,
+  maskRules: (workspaceId: string) =>
+    request<{ rules: DataMaskRuleInfo[]; builtin: { field: string; strategy: string; source: string }[] }>(
+      `/compliance/mask-rules?workspaceId=${encodeURIComponent(workspaceId)}`,
+    ),
+  upsertMaskRule: (input: { workspaceId: string; field: string; strategy: string; target?: string; enabled?: boolean }) =>
+    request<{ rule: DataMaskRuleInfo }>('/compliance/mask-rules', { method: 'POST', body: JSON.stringify(input) }),
+  deleteMaskRule: (id: string, workspaceId: string) =>
+    request<{ removed: string; field: string }>(`/compliance/mask-rules/${encodeURIComponent(id)}?workspaceId=${encodeURIComponent(workspaceId)}`, {
+      method: 'DELETE',
+    }),
+  maskPreview: (workspaceId: string, limit = 10) =>
+    request<{ samples: AuditLog[]; rules: { field: string; strategy: string; target: string }[] }>(
+      `/compliance/mask-preview?workspaceId=${encodeURIComponent(workspaceId)}&limit=${limit}`,
+    ),
+  retentionPolicies: (workspaceId: string) =>
+    request<{ policies: RetentionPolicyInfo[]; dataTypes: string[] }>(`/compliance/retention?workspaceId=${encodeURIComponent(workspaceId)}`),
+  upsertRetention: (input: { workspaceId: string; dataType: string; retentionDays: number; action?: string; enabled?: boolean }) =>
+    request<{ policy: RetentionPolicyInfo }>('/compliance/retention', { method: 'POST', body: JSON.stringify(input) }),
+  deleteRetention: (dataType: string, workspaceId: string) =>
+    request<{ removed: string }>(`/compliance/retention/${encodeURIComponent(dataType)}?workspaceId=${encodeURIComponent(workspaceId)}`, { method: 'DELETE' }),
+  applyRetention: (input: { workspaceId: string; dataType?: string; dryRun?: boolean }) =>
+    request<{ dryRun: boolean; results: RetentionRunResult[] }>(
+      `/compliance/retention/apply${input.dryRun === false ? '?confirm=true' : ''}`,
+      { method: 'POST', body: JSON.stringify(input) },
+    ),
+  compliancePackage: (input: { workspaceId: string; from: string; to: string }) =>
+    request<{
+      workspaceId: string;
+      generatedAt: string;
+      audit: AuditLog[];
+      maskRules: { field: string; strategy: string; target: string }[];
+      retentionPolicies: { dataType: string; retentionDays: number; action: string; enabled: boolean }[];
+      summary: { auditCount: number; dangerousCount: number; unconfirmedDangerous: number };
+    }>('/compliance/package', { method: 'POST', body: JSON.stringify(input) }),
 };
 
 export type { TaskBoardCard };

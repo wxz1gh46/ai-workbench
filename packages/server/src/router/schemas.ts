@@ -420,3 +420,265 @@ export function isSendNotifyRequest(v: unknown): v is { workspaceId: string; mes
   if (m.content === undefined) return false;
   return true;
 }
+
+/* ================================================================== */
+/* Phase 4 校验器                                                      */
+/* ================================================================== */
+
+const PLUGIN_KINDS = ['mcp', 'http', 'websocket', 'local'];
+const MCP_TRANSPORTS = ['stdio', 'http', 'sse', 'websocket'];
+const MASK_STRATEGIES = ['full', 'partial', 'hash', 'nullify'];
+const RETENTION_ACTIONS = ['delete', 'anonymize', 'archive'];
+const MASK_ACTIONS = ['majority', 'priority', 'concat', 'manual'];
+
+export function isInstallPluginRequest(v: unknown): v is { workspaceId: string } {
+  return isRecord(v) && isStr(v.workspaceId);
+}
+
+export function isGrantPluginRequest(v: unknown): v is { workspaceId: string; scopes: string[]; expiresAt?: string | null } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !Array.isArray(v.scopes) || v.scopes.length === 0) return false;
+  if (!v.scopes.every(isStr)) return false;
+  if (v.expiresAt !== undefined && v.expiresAt !== null && typeof v.expiresAt !== 'string') return false;
+  return true;
+}
+
+export function isRevokePluginRequest(v: unknown): v is { workspaceId: string; scopes?: string[] } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId)) return false;
+  if (v.scopes !== undefined && !(Array.isArray(v.scopes) && v.scopes.every(isStr))) return false;
+  return true;
+}
+
+export function isInvokePluginRequest(v: unknown): v is { workspaceId: string; tool: string; args?: Record<string, unknown>; confirm?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.tool)) return false;
+  if (v.args !== undefined && !isRecord(v.args)) return false;
+  if (v.confirm !== undefined && typeof v.confirm !== 'boolean') return false;
+  return true;
+}
+
+export function isRegisterMcpServerRequest(v: unknown): v is {
+  workspaceId: string;
+  name: string;
+  transport?: string;
+  endpoint?: string;
+  command?: string;
+  args?: string[];
+  secretRefs?: string[];
+} {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.name)) return false;
+  if (v.transport !== undefined && !MCP_TRANSPORTS.includes(String(v.transport))) return false;
+  if (v.endpoint !== undefined && !isStrOrEmpty(v.endpoint)) return false;
+  if (v.command !== undefined && !isStrOrEmpty(v.command)) return false;
+  if (v.args !== undefined && !(Array.isArray(v.args) && v.args.every(isStrOrEmpty))) return false;
+  if (v.secretRefs !== undefined && !(Array.isArray(v.secretRefs) && v.secretRefs.every(isStr))) return false;
+  return true;
+}
+
+export function isSavePaidCredentialRequest(v: unknown): v is { workspaceId: string; credentials: Record<string, string>; replace?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isRecord(v.credentials)) return false;
+  if (!Object.values(v.credentials).every((x) => typeof x === 'string')) return false;
+  if (v.replace !== undefined && typeof v.replace !== 'boolean') return false;
+  return true;
+}
+
+export function isPaidQueryRequest(v: unknown): v is { workspaceId: string; providerId: string; action: string; params?: Record<string, unknown>; noCache?: boolean; purpose?: string; confirm?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.providerId) || !isStr(v.action)) return false;
+  if (v.params !== undefined && !isRecord(v.params)) return false;
+  if (v.noCache !== undefined && typeof v.noCache !== 'boolean') return false;
+  if (v.purpose !== undefined && !isStrOrEmpty(v.purpose)) return false;
+  if (v.confirm !== undefined && typeof v.confirm !== 'boolean') return false;
+  return true;
+}
+
+export function isPromptGenerateRequest(v: unknown): v is { workspaceId: string; goal: string; context?: string; targetModel?: string; useModel?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.goal) || v.goal.length > 4000) return false;
+  if (v.context !== undefined && !isStrOrEmpty(v.context)) return false;
+  if (v.useModel !== undefined && typeof v.useModel !== 'boolean') return false;
+  return true;
+}
+
+export function isPromptOptimizeV4Request(v: unknown): v is { workspaceId: string; current: Record<string, string>; intent?: string; targetModel?: string; useModel?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isRecord(v.current)) return false;
+  if (!Object.values(v.current).every((x) => typeof x === 'string')) return false;
+  if (v.useModel !== undefined && typeof v.useModel !== 'boolean') return false;
+  return true;
+}
+
+export function isPromptCopyRequest(v: unknown): v is { sections: Record<string, string>; variables?: Record<string, string>; name?: string } {
+  if (!isRecord(v)) return false;
+  if (!isRecord(v.sections)) return false;
+  if (!Object.values(v.sections).every((x) => typeof x === 'string')) return false;
+  if (v.variables !== undefined && !isRecord(v.variables)) return false;
+  return true;
+}
+
+export function isPromptSaveV4Request(v: unknown): v is { workspaceId: string; name: string; sections: Record<string, string>; tags?: string[]; variables?: Record<string, unknown>[] } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.name) || !isRecord(v.sections)) return false;
+  if (!Object.values(v.sections).every((x) => typeof x === 'string')) return false;
+  if (v.tags !== undefined && !(Array.isArray(v.tags) && v.tags.every(isStrOrEmpty))) return false;
+  if (v.variables !== undefined && !Array.isArray(v.variables)) return false;
+  return true;
+}
+
+export function isAbTestCreateRequest(v: unknown): v is { workspaceId: string; templateName: string; versionA: number; versionB: number; name?: string } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.templateName)) return false;
+  if (typeof v.versionA !== 'number' || typeof v.versionB !== 'number') return false;
+  return v.versionA >= 1 && v.versionB >= 1;
+}
+
+export function isAbEvaluationRequest(v: unknown): v is { workspaceId: string; version: 'A' | 'B'; metric: string; value: number; sampleSize: number; note?: string } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.metric)) return false;
+  if (v.version !== 'A' && v.version !== 'B') return false;
+  if (typeof v.value !== 'number' || typeof v.sampleSize !== 'number') return false;
+  return true;
+}
+
+export function isClusterNodeRegisterRequest(v: unknown): v is { workspaceId: string; name: string; role?: string; host?: string; port?: number; resources?: Record<string, number>; labels?: Record<string, string> } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.name)) return false;
+  if (v.role !== undefined && !['leader', 'worker', 'candidate'].includes(String(v.role))) return false;
+  if (v.host !== undefined && !isStr(v.host)) return false;
+  if (v.port !== undefined && (typeof v.port !== 'number' || v.port < 0 || v.port > 65535)) return false;
+  if (v.resources !== undefined && !isRecord(v.resources)) return false;
+  if (v.labels !== undefined && !isRecord(v.labels)) return false;
+  return true;
+}
+
+export function isClusterHeartbeatRequest(v: unknown): v is { cpu?: number; memory?: number; gpu?: number; disk?: number; network?: number } {
+  if (v === undefined || v === null) return true;
+  if (!isRecord(v)) return false;
+  return ['cpu', 'memory', 'gpu', 'disk', 'network'].every((k) => v[k] === undefined || typeof v[k] === 'number');
+}
+
+export function isClusterPolicyUpdateRequest(v: unknown): v is { workspaceId: string; maxNodes?: number; maxParallelTasks?: number; resourceLimits?: Record<string, number>; fallbackEnabled?: boolean; heartbeatTimeoutMs?: number } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId)) return false;
+  if (v.maxNodes !== undefined && typeof v.maxNodes !== 'number') return false;
+  if (v.maxParallelTasks !== undefined && typeof v.maxParallelTasks !== 'number') return false;
+  if (v.resourceLimits !== undefined && !isRecord(v.resourceLimits)) return false;
+  if (v.fallbackEnabled !== undefined && typeof v.fallbackEnabled !== 'boolean') return false;
+  if (v.heartbeatTimeoutMs !== undefined && typeof v.heartbeatTimeoutMs !== 'number') return false;
+  return true;
+}
+
+export function isShardDistributeRequest(v: unknown): v is { workspaceId: string; taskId: string; items: unknown[]; shardCount?: number; goalId?: string; labels?: Record<string, string>; need?: Record<string, number> } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.taskId) || !Array.isArray(v.items)) return false;
+  if (v.items.length === 0) return false;
+  if (v.shardCount !== undefined && (typeof v.shardCount !== 'number' || v.shardCount < 1 || v.shardCount > 256)) return false;
+  if (v.need !== undefined && !isRecord(v.need)) return false;
+  return true;
+}
+
+export function isAgentPoolCreateRequest(v: unknown): v is { workspaceId: string; name: string; role: string; minAgents?: number; maxAgents?: number; model?: string | null; tools?: string[] } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.name) || !isStr(v.role)) return false;
+  if (v.minAgents !== undefined && typeof v.minAgents !== 'number') return false;
+  if (v.maxAgents !== undefined && typeof v.maxAgents !== 'number') return false;
+  if (v.tools !== undefined && !(Array.isArray(v.tools) && v.tools.every(isStr))) return false;
+  return true;
+}
+
+export function isAgentPoolScaleRequest(v: unknown): v is { workspaceId: string; target: number } {
+  if (!isRecord(v)) return false;
+  return isStr(v.workspaceId) && typeof v.target === 'number';
+}
+
+export function isAggregateResolveRequest(v: unknown): v is { workspaceId: string; decisions: { key: string; agentId?: string; value?: unknown }[] } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !Array.isArray(v.decisions) || v.decisions.length === 0) return false;
+  return v.decisions.every((d) => isRecord(d) && isStr(d.key));
+}
+
+export function isOrchestrateRequest(v: unknown): v is {
+  workspaceId: string;
+  goalId?: string;
+  nodes: { id: string; dependsOn: string[]; status: string; title?: string; priority?: number }[];
+  taskTexts?: Record<string, string>;
+  taskKinds?: Record<string, string>;
+  networkAllowed?: boolean;
+  maxParallel?: number;
+  aggregationStrategy?: string;
+  dryRun?: boolean;
+} {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !Array.isArray(v.nodes) || v.nodes.length === 0) return false;
+  const nodesOk = v.nodes.every((n) => {
+    if (!isRecord(n)) return false;
+    if (!isStr(n.id) || !Array.isArray(n.dependsOn)) return false;
+    if (!['pending', 'ready', 'running', 'blocked', 'succeeded', 'failed', 'cancelled'].includes(String(n.status))) return false;
+    return n.dependsOn.every(isStrOrEmpty);
+  });
+  if (!nodesOk) return false;
+  if (v.aggregationStrategy !== undefined && !MASK_ACTIONS.includes(String(v.aggregationStrategy))) return false;
+  if (v.maxParallel !== undefined && (typeof v.maxParallel !== 'number' || v.maxParallel < 1 || v.maxParallel > 32)) return false;
+  return true;
+}
+
+export function isRbacRoleCreateRequest(v: unknown): v is { workspaceId: string; name: string; permissions: string[] } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.name) || !Array.isArray(v.permissions)) return false;
+  return v.permissions.every(isStr);
+}
+
+export function isRbacAssignRequest(v: unknown): v is { workspaceId: string; userId: string; role: string } {
+  if (!isRecord(v)) return false;
+  return isStr(v.workspaceId) && isStr(v.userId) && isStr(v.role);
+}
+
+export function isSsoConfigRequest(v: unknown): v is { workspaceId: string; protocol?: string; issuer: string; clientId: string; clientSecretRef: string; redirectUri: string; groupMapping?: Record<string, string>; enabled?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.issuer) || !isStr(v.clientSecretRef)) return false;
+  if (v.protocol !== undefined && !['oidc', 'saml'].includes(String(v.protocol))) return false;
+  if (v.groupMapping !== undefined && !isRecord(v.groupMapping)) return false;
+  if (v.enabled !== undefined && typeof v.enabled !== 'boolean') return false;
+  return true;
+}
+
+export function isMaskRuleRequest(v: unknown): v is { workspaceId: string; field: string; strategy: string; target?: string; enabled?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.field)) return false;
+  if (!MASK_STRATEGIES.includes(String(v.strategy))) return false;
+  return v.enabled === undefined || typeof v.enabled === 'boolean';
+}
+
+export function isRetentionUpsertRequest(v: unknown): v is { workspaceId: string; dataType: string; retentionDays: number; action?: string; enabled?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.dataType)) return false;
+  if (typeof v.retentionDays !== 'number') return false;
+  if (v.action !== undefined && !RETENTION_ACTIONS.includes(String(v.action))) return false;
+  if (v.enabled !== undefined && typeof v.enabled !== 'boolean') return false;
+  return true;
+}
+
+export function isRetentionApplyRequest(v: unknown): v is { workspaceId: string; dataType?: string; dryRun?: boolean; confirm?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId)) return false;
+  if (v.dataType !== undefined && !isStr(v.dataType)) return false;
+  if (v.dryRun !== undefined && typeof v.dryRun !== 'boolean') return false;
+  if (v.confirm !== undefined && typeof v.confirm !== 'boolean') return false;
+  return true;
+}
+
+export function isAuditExportRequest(v: unknown): v is { workspaceId: string; from: string; to: string; actor?: string; type?: string; confirm?: boolean } {
+  if (!isRecord(v)) return false;
+  if (!isStr(v.workspaceId) || !isStr(v.from) || !isStr(v.to)) return false;
+  if (v.confirm !== undefined && typeof v.confirm !== 'boolean') return false;
+  return true;
+}
+
+export function isAuditListQuery(v: Record<string, string | undefined>): boolean {
+  return Boolean(v.workspaceId);
+}
+
+export { PLUGIN_KINDS, MASK_STRATEGIES, RETENTION_ACTIONS };

@@ -292,17 +292,24 @@ pnpm typecheck            # 三个包的类型检查
 | --- | --- | --- |
 | **Phase 1 MVP** | 桌面壳 · 聊天 · 模型接入 · SQLite · 文件上传 · 基础 Agent · 基础设置 | ✅ 已交付 |
 | **Phase 2 核心能力** | 目标模式 · 多 Agent 并行 · Office 处理 · 深度研究 · 百万 Token 上下文 | 🟡 目标模式/多 Agent/Office/分层上下文已完成；深度研究联网检索待做 |
-| **Phase 3 交付与自动化** | 网站部署 · Neon/Supabase · 定制看板 · 定时任务 · 推送通知 | 🟡 看板/定时任务已完成；部署与推送待做 |
-| **Phase 4 生态与集群** | 实验性集群 · 精选插件 · 付费数据库 · 提示词工程 · 企业安全审计 | 🟡 插件市场/提示词/审计已完成；跨机集群与真实数据源对接待做 |
+| **Phase 3 交付与自动化** | 网站部署 · Neon/Supabase · 定制看板 · 定时任务 · 推送通知 | ✅ 已交付 |
+| **Phase 4 生态与集群** | 实验性集群 · 精选插件 · 付费数据库 · 提示词工程 · 企业安全审计 | ✅ 已交付（MCP stdio 宿主进程、真实数据源联调待补） |
 
 ---
 
 ## 回滚方案
 
 - **代码**：每一阶段独立 PR，`git revert <merge-commit>` 即可回滚
-- **数据库**：`packages/server/src/db/migrations/0001_init.down.sql` 提供完整反向脚本
+- **数据库**：每个迁移都有 `.down.sql`（`0001_init` / `0002_phase2` / `0003_phase3` / `0004_phase4`）
+- **功能开关**：置 0 即可停用对应能力，**数据全保留**（见 `docs/phase4-rollback.md` 的 L1~L5 分级）
 - **数据本身**：删除 `data/` 目录即可回到初始状态（本地单机，无外部依赖）
 - **配置**：`.env` 不纳入版本控制，回滚代码不影响用户配置
+
+```bash
+pnpm --filter @ai/server db:rollback       # 回滚最后一个迁移
+pnpm --filter @ai/server verify:rollback   # 验证 Phase 2/3 回滚
+pnpm --filter @ai/server verify:phase4     # 验证 Phase 4 全部硬约束（含 0004 回滚）
+```
 
 ---
 
@@ -310,9 +317,9 @@ pnpm typecheck            # 三个包的类型检查
 
 1. **Phase 2 收尾**：接入 LanceDB 做真语义召回；用 LLM 自动触发滚动摘要
 2. **Phase 2 收尾**：LibreOffice headless 转换解决 CJK PDF 排版
-3. **Phase 3**：实现 Vercel / Cloudflare Pages Provider 适配器与 Neon 编排
-4. **Phase 3**：推送渠道（桌面通知 / 邮件 / Webhook / 飞书 / 钉钉 / 企业微信）
-5. **Phase 4**：跨机集群调度（BullMQ + Redis）、MCP 插件宿主进程隔离
+3. **Phase 4 收尾**：MCP stdio 宿主进程（`PluginRuntime` 的 executor 已预留注入点）
+4. **Phase 4 收尾**：付费数据源在你的账号下真实联调（适配器与合规守卫已就绪）
+5. **多实例化**：把 `EventBus` / `ResultCache` / 限流窗口换成 Redis，即可横向扩展
 
 
 ---
@@ -439,7 +446,7 @@ Phase 3 把「工作」变成「交付物」：一句话生成网站并部署上
 
 ```bash
 pnpm install --ignore-scripts && pnpm rebuild better-sqlite3
-pnpm typecheck && pnpm test          # 438 服务端 + 4 桌面用例
+pnpm typecheck && pnpm test          # 710 服务端 + 4 桌面用例
 pnpm dev:server && pnpm dev:desktop
 ```
 
@@ -488,3 +495,117 @@ pnpm dev:server && pnpm dev:desktop
 # 创建私人仓库并推送（Token 只从环境变量读，不写入 git 配置、不回显）
 GITHUB_TOKEN=ghp_xxx ./scripts/upload-github.sh --repo ai-workbench
 ```
+
+---
+
+## Phase 4：生态、集群与提示词工程
+
+Phase 4 把工作台从「个人工具」推向「可协作的平台」：插件生态、付费数据、提示词工程、多节点集群、企业安全。
+
+### 能做什么
+
+**精选插件（MCP 优先）**
+- 插件市场：10 个精选插件，含 4 个 MCP 服务器 + 6 个数据源接入
+- 清单规范：`permissions` / `tools` / `resources` / `prompts` / `signature`
+- **逐项授权**：默认不授予任何权限，可设过期时间，可随时撤销
+- **沙箱**：网络/文件/资源受限；拒绝内网与云元数据地址（SSRF 防护）
+- **防篡改**：manifest 存快照 + 哈希；内容变更强制重新授权（防权限静默提升）
+- **调用日志**：成功/失败/被拒全部留痕，入参自动脱敏
+
+**付费数据库（8 家，全部合规）**
+
+| 同花顺 · 天眼查 · Wind 万得 · 恒生聚源 · 标普全球 · IMF · 华宇元典 · 学术数据库 |
+| --- |
+
+- 只走**官方 API 或你本机已授权的终端**；无爬虫、无共享账号、无登录态绕过
+- 合规守卫拦截「绕过限流 / 爬虫 / 全量导出 / 共享账号 / 破解」类请求，**拒因可读且落库**
+- 三道防线：注册表声明约束 → 合规守卫 → 本地限流 + 审计
+- 未配置凭据时**显式降级**（`degraded: true` + 说明），不返回假数据、不抛 500
+
+**提示词工程**
+- 九要素结构 + 变量占位符（类型推断 / 必填 / 默认值）
+- 9 个预置模板（代码评审 / 需求分析 / 深度调研 / 数据分析 / 任务规划 / 内容写作 / 部署方案 / 多 Agent 编排 / 提示词评审）
+- 生成器 + 优化器：**规则优先，模型增强**（无密钥也能用，结果可复现）
+- 优化覆盖：消除歧义 · 补全约束 · 结构化 · 边界条件 · 失败处理 · 评估标准
+- 版本管理 + 回滚（回滚生成新版本，历史全保留）
+- A/B 测试：人工指标（准确性/清晰度/可用性）+ 自动指标（结构/长度/变量覆盖）
+- **样本不足时不给确定结论** —— 宁可不给，也不给错
+
+**实验性集群**
+- 节点注册 / 心跳 / **确定性选举**（可复现、可解释）/ 任务分片 / 负载感知分发
+- 容错：节点失联改派、失败重试（限额）、已完成分片永不重跑
+- 资源治理：`maxNodes` / `maxParallelTasks` / `resourceLimits` / `heartbeatTimeoutMs`
+- **降级单机**：集群不可用时任务照样跑完，并明确告知原因与恢复方式
+- 分片策略自动选择：分布均匀用 `by-count`，有超大项用 `by-weight`（LPT 贪心）
+
+**多 Agent 并行**
+- Agent 池（按角色，min/max 区间，缩容拒绝驱逐运行中实例）
+- 任务 DAG（环检测给出版路径、拓扑分层、就绪/阻塞计算）
+- 并行度决策：`min(工作区配置, 集群策略, 池容量, 预算, CPU 核数, 就绪数)` + **可解释的 factors**
+- 路由：模型（成本/上下文/擅长领域）、工具（关键词）、Agent（角色匹配 + 容量）
+- 结果聚合：majority / priority / concat / manual —— **冲突显式记录，平票不裁决**
+- 成本控制：按模型价格表计量、预算预警、超限暂停并行
+
+**企业安全与审计**
+- RBAC：20 个权限点、6 个内置角色、多角色取并集、**owner 不可锁死**
+- SSO（OIDC/SAML）：只接受环境变量名、state+nonce 防 CSRF/重放、密钥缺失拒绝启用
+- 审计日志：全量操作留痕、**危险但未确认的记录单独告警**
+- 合规导出：强制脱敏、必须带时间范围、**导出行为本身也留痕**；修复了「静默截断 90% 数据」的真实缺陷
+- 数据脱敏：full/partial/hash/nullify + **递归处理嵌套结构** + 内置兜底策略
+- 保留策略：**默认预演**、核心表禁止配置（防删库）
+
+### 安全底线（硬约束，无开关可关）
+
+1. **35 类危险操作服务端强制二次确认**，无 confirm 返回 `428 CONFIRM_REQUIRED` + 人类可读后果
+2. **凭据不落明文**：源码 / 日志 / DB / 审计 / 接口响应全部无明文；AES-256-GCM 加密；换密钥后解密失败会明确报错
+3. **SSRF 防护**：插件 endpoint、MCP 服务器、集群节点统一拒绝内网与云元数据地址
+4. **路径边界**：文件访问必须落在工作区内 + 命中授权前缀；**路径穿越直接拒绝（不静默修正）**
+5. **插件不可信**：清单外工具拒绝、未授权拒绝、危险工具需确认、所有调用留痕
+6. **合规不妥协**：不绕过反爬/风控、不用共享账号、不代注册账号、不代理登录
+7. **降级要诚实**：拿不到数据就说拿不到，不返回 0 或空对象让调用方误判
+
+### 快速体验（无需任何密钥）
+
+```bash
+pnpm install --ignore-scripts && pnpm rebuild better-sqlite3
+pnpm typecheck && pnpm test
+pnpm dev:server && pnpm dev:desktop
+```
+
+打开桌面端 → **插件市场**：
+
+1. 搜「文件」→ 安装 `mcp-filesystem` → 在弹出的权限对话框里勾选 `fs:read`
+2. 切到 **付费数据库** → 选「IMF（无需凭据）」→ 直接查询全球宏观数据
+3. 切到 **提示词工作台** → 从模板库选「深度调研」→ 生成 → 优化 → 保存两个版本 → 建 A/B 测试
+4. 切到 **集群视图** → 点「注册本机节点」→ 看到节点上线、leader 选出、term=1
+5. 切到 **安全中心** → 看审计日志里刚才的全部操作
+
+### Phase 4 测试覆盖
+
+```
+src/plugins/phase4.test.ts      33  清单合规 / 哈希幂等 / 沙箱策略 / 安装授权撤销 / 调用日志脱敏 / MCP
+src/paidData/phase4.test.ts     33  注册表自洽 / 合规守卫 / 缓存 TTL / 查询降级 / 凭据加密 / 8 个适配器
+src/prompt/phase4.test.ts       31  变量渲染 / 意图分类 / 生成 / 优化 / 模板库 / 版本回滚 / A/B 判定
+src/cluster/phase4.test.ts      39  分片均衡 / 节点注册 / 心跳超时 / 改派重试 / 选举 / 策略 / 降级 / 管理器
+src/agents/phase4.test.ts       48  DAG 环检测 / 并行度 / 路由 / 聚合冲突 / 成本 / 池扩缩容 / 编排
+src/enterprise/phase4.test.ts   38  RBAC / 脱敏 / 审计 / 保留策略 / SSO / 合规包 / 导出越权
+test/phase4-e2e.test.ts          9  插件全链路 / 付费数据 / 提示词 / 集群 / 编排 / 企业安全 / 无凭据可跑通
+test/phase4-security.test.ts    25  危险动作全覆盖 / 凭据不落明文 / SSRF / 越权 / 注入 / 并发
+test/phase4-perf.test.ts        16  10000 项分片 / 1000 节点 DAG / 20000 条成本汇总 / 5000 条导出
+```
+
+运行：`pnpm test` / `pnpm verify:phase4`
+
+### Phase 4 文档
+
+| 文档 | 内容 |
+| --- | --- |
+| `docs/phase4-architecture.md` | 架构增量、7 条关键设计决策、端到端数据流、兼容处理 |
+| `docs/phase4-data-model.md` | 29 张新表逐字段说明、保留字陷阱、表清单 |
+| `docs/phase4-api.md` | 约 90 个接口 + 错误码 + WS 事件表 |
+| `docs/phase4-plugin-development.md` | 清单规范、合规红线自查、签名、沙箱约束、调试方法 |
+| `docs/phase4-paid-data-compliance.md` | 8 家数据源接入方式、三道合规防线、凭据保管、自查清单 |
+| `docs/phase4-cluster-runbook.md` | 集群部署、心跳、选举、分发、容错、监控、FAQ |
+| `docs/phase4-prompt-engineering.md` | 九要素、变量、生成器、优化器、版本、A/B 判定规则 |
+| `docs/phase4-security-audit.md` | 信任边界、35 类危险动作、凭据保护、SSRF、RBAC、脱敏、审计 |
+| `docs/phase4-rollback.md` | L1~L5 分级回滚 + 各 Step 独立回滚矩阵 + 验证清单 |

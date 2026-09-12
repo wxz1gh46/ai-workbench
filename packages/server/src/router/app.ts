@@ -2,7 +2,7 @@ import { Hono } from 'hono';
 import { cors } from 'hono/cors';
 import { logger as honoLogger } from 'hono/logger';
 import { EventType, type ApiResponse, type Artifact } from '@ai/shared';
-import { getDb, type Db } from '../db/client.ts';
+import { getDb, getSqlite, type Db } from '../db/client.ts';
 import { runMigrations } from '../db/migrate.ts';
 import { eq } from 'drizzle-orm';
 import { goals } from '../db/schema/index.ts';
@@ -43,6 +43,31 @@ import type { WebsitePlan } from '@ai/shared';
 import { readFile } from 'node:fs/promises';
 import { safeJoin } from '../tools/fs-tools.ts';
 import * as S from './schemas.ts';
+/* Phase 4 服务 */
+import { PluginInstaller } from '../plugins/pluginInstaller.ts';
+import { PluginRuntime } from '../plugins/pluginRuntime.ts';
+import { PluginCallLogger } from '../plugins/pluginCallLog.ts';
+import { McpServerRegistry } from '../plugins/mcpServerRegistry.ts';
+import { createMcpClient } from '../plugins/mcpClient.ts';
+import { PluginComplianceError } from '../plugins/pluginManifest.ts';
+import { listProviders, findProvider, requiredCredentialKeys } from '../paidData/providerRegistry.ts';
+import { CredentialManager } from '../paidData/credentialManager.ts';
+import { PaidDataQueryRunner } from '../paidData/queryRunner.ts';
+import { PromptServiceV4 } from '../prompt/promptServiceV4.ts';
+import { ClusterManager } from '../cluster/clusterManager.ts';
+import { shardAuto } from '../cluster/shardScheduler.ts';
+import { AgentPoolService } from '../agents/agentPool.ts';
+import { RouteRecorder } from '../agents/agentRouter.ts';
+import { AggregationStore } from '../agents/resultAggregator.ts';
+import { CostController } from '../agents/costController.ts';
+import { ParallelOrchestrator } from '../agents/parallelOrchestrator.ts';
+import { MODEL_PRICES } from '../agents/costController.ts';
+import { RbacService, ALL_PERMISSIONS, PERMISSIONS } from '../enterprise/rbac.ts';
+import { DataMaskService } from '../enterprise/dataMask.ts';
+import { AuditQueryService } from '../enterprise/auditLog.ts';
+import { RetentionService, RETENTION_DATA_TYPES, type RetentionDataType } from '../enterprise/retentionPolicy.ts';
+import { SsoService } from '../enterprise/sso.ts';
+import { ComplianceExportService } from '../enterprise/complianceExport.ts';
 
 export interface AppDeps {
   db?: Db;
@@ -109,6 +134,27 @@ export function createApp(deps: AppDeps = {}) {
   const auditorsV3 = auditors(db);
   const { deploy: deployAuditor, db: dbAuditor, schedule: scheduleAuditor } = auditorsV3;
   
+  /* Phase 4 服务实例 */
+  const pluginInstaller = new PluginInstaller(db);
+  const pluginRuntime = new PluginRuntime(db);
+  const pluginCalls = new PluginCallLogger(db);
+  const mcpRegistry = new McpServerRegistry(db);
+  const credentials = new CredentialManager(db);
+  const paidRunner = new PaidDataQueryRunner(db);
+  const promptsV4 = new PromptServiceV4(db);
+  const cluster = new ClusterManager(db, { clusterEnabled: config.features.phase4Cluster });
+  const pools = new AgentPoolService(db);
+  const routeRecorder = new RouteRecorder(db);
+  const aggregations = new AggregationStore(db);
+  const costs = new CostController(db);
+  const orchestrator = new ParallelOrchestrator(db);
+  const rbac = new RbacService(db);
+  const dataMask = new DataMaskService(db);
+  const auditQuery = new AuditQueryService(db, dataMask);
+  const retention = new RetentionService(db);
+  const sso = new SsoService(db);
+  const complianceExport = new ComplianceExportService(db, auditQuery, config.dataDir);
+
   const auditorDeploy = deployAuditor;
   const auditorDb = dbAuditor;
   const auditorSchedule = scheduleAuditor;
@@ -1321,7 +1367,877 @@ export function createApp(deps: AppDeps = {}) {
     return ok(c, { logs: await notify.listLogs(workspaceId, Number(c.req.query('limit') ?? 100), c.req.query('channelId') || undefined) });
   });
 
+/* ================================================================== */
+  /* Phase 4：生态、集群与提示词工程                                     */
+  /* ================================================================== */
+
+  const requirePhase4 = (key: keyof typeof config.features, label: string) => {
+    if (!config.features[key]) {
+      throw AppError.badRequest(`${label} 已被功能开关关闭（config.features.${String(key)} = false）；历史数据仍保留，重新打开即可恢复`);
+    }
+  };
+
+  /* ------------------- Step 1：插件系统与 MCP ------------------- */
+
+  app.get('/plugins/market', (c) =>
+    ok(c, {
+      catalog: pluginInstaller.browse({
+        ...(c.req.query('q') ? { q: c.req.query('q') as string } : {}),
+        ...(c.req.query('kind') ? { kind: c.req.query('kind') as string } : {}),
+        ...(c.req.query('requiresAuth') === undefined ? {} : { requiresAuth: c.req.query('requiresAuth') === 'true' }),
+      }),
+      kinds: ['mcp', 'http', 'websocket', 'local'],
+    }),
+  );
+
+  app.get('/plugins/market/:name', (c) => ok(c, pluginInstaller.detail(c.req.param('name'))));
+
+  /** Phase 4 插件视图：安装态 + 授权态 + 可更新 */
+  app.get('/plugins/installed', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { plugins: await pluginInstaller.listInstalled(workspaceId) });
+  });
+
+  app.post('/plugins/install', async (c) => {
+    requirePhase4('phase4PaidPlugins', '插件系统');
+    const body = await parseJson(c, S.isInstallPluginRequest, 'plugin');
+    const name = String(c.req.query('name') ?? '');
+    if (!name) throw AppError.badRequest('缺少 name 查询参数（要安装的插件名）');
+    gate('plugin.install', c.req.query('confirm') === 'true', { name });
+    const result = await pluginInstaller.install(body.workspaceId, name);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.install', targetType: 'plugin', targetId: result.pluginId, confirmedByUser: true, detail: { name: result.name, version: result.version, signed: result.signed, permissions: result.permissions.map((p) => p.scope) } });
+    eventBus.publishBuffered(EventType.PLUGIN_INSTALLED, { name: result.name, version: result.version }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result, 201);
+  });
+
+  app.post('/plugins/:id/uninstall', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string };
+    if (!body.workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('plugin.uninstall', c.req.query('confirm') === 'true', { pluginId: c.req.param('id') });
+    const result = await pluginInstaller.uninstall(body.workspaceId, c.req.param('id'));
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.uninstall', targetType: 'plugin', targetId: c.req.param('id'), confirmedByUser: true, detail: { name: result.name } });
+    eventBus.publishBuffered(EventType.PLUGIN_UNINSTALLED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.post('/plugins/:id/update', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string };
+    if (!body.workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await pluginInstaller.update(body.workspaceId, c.req.param('id'));
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.update', targetType: 'plugin', targetId: c.req.param('id'), confirmedByUser: true, detail: { from: result.previousVersion, to: result.latest, grantsRevoked: result.grantedScopes.length === 0 } });
+    return ok(c, result);
+  });
+
+  app.get('/plugins/:id/permissions', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const installed = await pluginInstaller.listInstalled(workspaceId);
+    const target = installed.find((p) => p.pluginId === c.req.param('id') || p.installationId === c.req.param('id'));
+    if (!target) throw AppError.notFound(`插件未安装: ${c.req.param('id')}`);
+    return ok(c, { installationId: target.installationId, permissions: target.permissions, grantedScopes: target.grantedScopes, requiresUserAuth: target.requiresUserAuth, secretRefs: target.secretRefs });
+  });
+
+  app.post('/plugins/:id/grant', async (c) => {
+    const body = await parseJson(c, S.isGrantPluginRequest, 'grant');
+    const result = await pluginInstaller.grant({ workspaceId: body.workspaceId, installationId: c.req.param('id'), scopes: body.scopes, ...(body.expiresAt === undefined ? {} : { expiresAt: body.expiresAt }) });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.grant', targetType: 'plugin', targetId: c.req.param('id'), confirmedByUser: true, detail: { scopes: result.granted } });
+    eventBus.publishBuffered(EventType.PLUGIN_GRANTED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.post('/plugins/:id/revoke', async (c) => {
+    const body = await parseJson(c, S.isRevokePluginRequest, 'revoke');
+    gate('plugin.revoke', c.req.query('confirm') === 'true', { installationId: c.req.param('id') });
+    const result = await pluginInstaller.revoke({ workspaceId: body.workspaceId, installationId: c.req.param('id'), ...(body.scopes ? { scopes: body.scopes } : {}) });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.revoke', targetType: 'plugin', targetId: c.req.param('id'), confirmedByUser: true, detail: { revoked: result.revoked } });
+    eventBus.publishBuffered(EventType.PLUGIN_REVOKED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.post('/plugins/:id/invoke', async (c) => {
+    const body = await parseJson(c, S.isInvokePluginRequest, 'invoke');
+    requirePhase4('phase4PaidPlugins', '插件调用');
+    const result = await pluginRuntime.invoke({
+      workspaceId: body.workspaceId,
+      installationId: c.req.param('id'),
+      tool: body.tool,
+      ...(body.args ? { args: body.args } : {}),
+      confirm: body.confirm === true,
+    });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'plugin.invoke', targetType: 'plugin', targetId: c.req.param('id'), confirmedByUser: body.confirm === true, detail: { tool: body.tool, ok: result.ok, degraded: result.degraded, denied: result.denied?.missingScopes ?? null } });
+    eventBus.publishBuffered(EventType.PLUGIN_CALLED, { tool: body.tool, ok: result.ok }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.get('/plugins/:id/calls', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { calls: await pluginCalls.list(workspaceId, c.req.param('id'), Number(c.req.query('limit') ?? 100)) });
+  });
+
+  app.get('/mcp/servers', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const servers = await mcpRegistry.list(workspaceId);
+    return ok(c, { servers, transports: ['stdio', 'http', 'sse', 'websocket'] });
+  });
+
+  app.post('/mcp/servers', async (c) => {
+    const body = await parseJson(c, S.isRegisterMcpServerRequest, 'mcp');
+    gate('mcp.server.register', c.req.query('confirm') === 'true', { name: body.name });
+    const server = await mcpRegistry.register({
+      workspaceId: body.workspaceId,
+      name: body.name,
+      ...(body.transport ? { transport: body.transport as 'stdio' } : {}),
+      ...(body.endpoint ? { endpoint: body.endpoint } : {}),
+      ...(body.command ? { command: body.command } : {}),
+      ...(body.args ? { args: body.args } : {}),
+      ...(body.secretRefs ? { secretRefs: body.secretRefs } : {}),
+    });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'mcp.server.register', targetType: 'mcp_server', targetId: server.id, confirmedByUser: true, detail: { name: server.name, transport: server.transport, endpoint: server.endpoint } });
+    eventBus.publishBuffered(EventType.MCP_SERVER_UPDATED, { id: server.id, name: server.name }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, { server }, 201);
+  });
+
+  app.delete('/mcp/servers/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('mcp.server.remove', c.req.query('confirm') === 'true', { serverId: c.req.param('id') });
+    const result = await mcpRegistry.remove(workspaceId, c.req.param('id'));
+    await audit.record({ workspaceId, actor: 'user', action: 'mcp.server.remove', targetType: 'mcp_server', targetId: c.req.param('id'), confirmedByUser: true, detail: {} });
+    return ok(c, result);
+  });
+
+  /** 能力探测：连通后同步工具清单（未连通则显式 degraded） */
+  app.post('/mcp/servers/:id/sync', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const server = await mcpRegistry.get(workspaceId, c.req.param('id'));
+    const client = createMcpClient(server as never);
+    const result = await client.listTools();
+    if (result.degraded) {
+      await mcpRegistry.setStatus(server.id, 'registered', 'stdio 传输需要宿主进程，未注入 host');
+      return ok(c, { synced: 0, degraded: true, note: '未接入 MCP 宿主进程，工具清单未同步（不会伪造工具列表）', tools: [] });
+    }
+    const tools = await mcpRegistry.syncTools(server.id, result.tools.map((t) => ({ name: t.name, description: t.description, schema: t.schema })));
+    await mcpRegistry.setStatus(server.id, 'connected', null);
+    return ok(c, { synced: tools.length, degraded: false, tools });
+  });
+
+  app.get('/mcp/servers/:id/tools', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    await mcpRegistry.get(workspaceId, c.req.param('id'));
+    return ok(c, { tools: await mcpRegistry.listTools(c.req.param('id')) });
+  });
+
+  /* ------------------- Step 2：付费数据库 ------------------- */
+
+  app.get('/paid-data/providers', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    const providers = listProviders();
+    if (!workspaceId) return ok(c, { providers: providers.map((p) => ({ ...p, credentialConfigured: false, configuredFields: [] })) });
+    const configured = await credentials.list(workspaceId);
+    return ok(c, {
+      providers: providers.map((p) => {
+        const hit = configured.find((x) => x.providerId === p.id);
+        return { ...p, status: hit ? hit.status : p.requiresUserAuth ? 'unconfigured' : 'available', credentialConfigured: Boolean(hit), configuredFields: hit?.fieldNames ?? [] };
+      }),
+      disclaimer: '所有付费数据源只通过官方 API 或你本机已授权的终端接入；工作台不代持账号、不绕过反爬、不共享登录态。',
+    });
+  });
+
+  app.post('/paid-data/credentials', async (c) => {
+    const body = await parseJson(c, S.isSavePaidCredentialRequest, 'credentials');
+    gate('paid_data.credential.save', c.req.query('confirm') === 'true', { providerId: c.req.query('providerId') ?? '' });
+    const providerId = String(c.req.query('providerId') ?? '');
+    if (!providerId) throw AppError.badRequest('缺少 providerId 查询参数');
+    const result = await credentials.save({ workspaceId: body.workspaceId, providerId, credentials: body.credentials, replace: body.replace === true });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'paid_data.credential.save', targetType: 'paid_data_provider', targetId: providerId, confirmedByUser: true, detail: { fields: result.fieldNames, missing: result.requiredMissing } });
+    return ok(c, result, 201);
+  });
+
+  app.get('/paid-data/credentials', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { credentials: await credentials.list(workspaceId), requiredFields: Object.fromEntries(listProviders().map((p) => [p.id, requiredCredentialKeys(p.id)])) });
+  });
+
+  app.delete('/paid-data/credentials/:providerId', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('paid_data.credential.delete', c.req.query('confirm') === 'true', { providerId: c.req.param('providerId') });
+    const result = await credentials.remove(workspaceId, c.req.param('providerId'));
+    await audit.record({ workspaceId, actor: 'user', action: 'paid_data.credential.delete', targetType: 'paid_data_provider', targetId: c.req.param('providerId'), confirmedByUser: true, detail: {} });
+    return ok(c, result);
+  });
+
+  /** 预检：提交查询前告诉用户「会不会被合规守卫拒绝」 */
+  app.post('/paid-data/preflight', async (c) => {
+    const body = await parseJson(c, S.isPaidQueryRequest, 'preflight');
+    const creds = await credentials.resolve(body.workspaceId, body.providerId);
+    const spec = findProvider(body.providerId);
+    const hasCredentials = Boolean(spec) && spec!.credentialFields.filter((f) => f.required).every((f) => Boolean(creds[f.key]?.trim()));
+    return ok(c, paidRunner.preflight({ providerId: body.providerId, action: body.action, params: body.params ?? {}, hasCredentials }));
+  });
+
+  app.post('/paid-data/query', async (c) => {
+    const body = await parseJson(c, S.isPaidQueryRequest, 'query');
+    requirePhase4('phase4PaidPlugins', '付费数据查询');
+
+    gate('paid_data.query', c.req.query('confirm') === 'true' || body.confirm === true, { providerId: body.providerId, action: body.action });
+    const creds = await credentials.resolve(body.workspaceId, body.providerId);
+    const result = await paidRunner.run({
+      workspaceId: body.workspaceId,
+      providerId: body.providerId,
+      action: body.action,
+      params: body.params ?? {},
+      credentials: creds,
+      noCache: body.noCache === true,
+      ...(body.purpose ? { purpose: body.purpose } : {}),
+    });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'paid_data.query', targetType: 'paid_data_provider', targetId: body.providerId, confirmedByUser: true, detail: { action: body.action, status: result.status, cached: result.cached, degraded: result.degraded, blockedReason: result.blockedReason ?? null } });
+    eventBus.publishBuffered(result.status === 'blocked' ? EventType.PAID_DATA_BLOCKED : EventType.PAID_DATA_QUERY, { providerId: body.providerId, action: body.action, status: result.status }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.get('/paid-data/queries', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { queries: await paidRunner.listQueries(workspaceId, Number(c.req.query('limit') ?? 50)) });
+  });
+
+  app.get('/paid-data/queries/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await paidRunner.getQuery(workspaceId, c.req.param('id')));
+  });
+
+  /* ------------------- Step 3：提示词工程 ------------------- */
+
+  app.get('/prompts/library', (c) => ok(c, { templates: promptsV4.library() }));
+
+  app.post('/prompts/library/:key', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; name?: string };
+    if (!body.workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await promptsV4.createFromLibrary(body.workspaceId, c.req.param('key'), body.name);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'prompt.library.use', targetType: 'prompt_template', targetId: result.templateId, confirmedByUser: true, detail: { key: c.req.param('key'), version: result.version } });
+    return ok(c, result, 201);
+  });
+
+  app.get('/prompts/catalog', (c) => ok(c, { metrics: promptsV4.metricCatalog() }));
+
+  app.get('/prompts/v4', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { templates: await promptsV4.list(workspaceId) });
+  });
+
+  app.get('/prompts/v4/:name', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const version = c.req.query('version') ? Number(c.req.query('version')) : undefined;
+    return ok(c, await promptsV4.detail(workspaceId, c.req.param('name'), version));
+  });
+
+  app.post('/prompts/generate', async (c) => {
+    requirePhase4('phase4Prompt', '提示词工程');
+    const body = await parseJson(c, S.isPromptGenerateRequest, 'generate');
+    const result = await promptsV4.generate({ workspaceId: body.workspaceId, goal: body.goal, ...(body.context ? { context: body.context } : {}), ...(body.targetModel ? { targetModel: body.targetModel } : {}), ...(body.useModel === undefined ? {} : { useModel: body.useModel }) });
+    eventBus.publishBuffered(EventType.PROMPT_GENERATED, { intent: result.intent, degraded: result.degraded }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.post('/prompts/optimize-v4', async (c) => {
+    const body = await parseJson(c, S.isPromptOptimizeV4Request, 'optimize');
+    const result = await promptsV4.optimize({ workspaceId: body.workspaceId, current: body.current as never, ...(body.intent ? { intent: body.intent } : {}), ...(body.targetModel ? { targetModel: body.targetModel } : {}), ...(body.useModel === undefined ? {} : { useModel: body.useModel }) });
+    eventBus.publishBuffered(EventType.PROMPT_OPTIMIZED, { score: result.score, degraded: result.degraded }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  /** 一键复制：返回可直接粘贴的 Markdown */
+  app.post('/prompts/copy', async (c) => {
+    const body = await parseJson(c, S.isPromptCopyRequest, 'copy');
+    return ok(c, promptsV4.copyable({ sections: body.sections as never, ...(body.variables ? { variables: body.variables } : {}), ...(body.name ? { name: body.name } : {}) }));
+  });
+
+  app.post('/prompts/v4', async (c) => {
+    requirePhase4('phase4Prompt', '提示词工程');
+    const body = await parseJson(c, S.isPromptSaveV4Request, 'prompt');
+    const result = await promptsV4.save({
+      workspaceId: body.workspaceId,
+      name: body.name,
+      sections: body.sections as never,
+      ...(body.tags ? { tags: body.tags } : {}),
+      ...(body.variables ? { variables: body.variables as never } : {}),
+    });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'prompt.version.save', targetType: 'prompt_template', targetId: result.templateId, confirmedByUser: true, detail: { name: result.name, version: result.version } });
+    eventBus.publishBuffered(EventType.PROMPT_VERSION_SAVED, { name: result.name, version: result.version }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result, 201);
+  });
+
+  app.post('/prompts/v4/:name/rollback', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; version?: number };
+    if (!body.workspaceId || typeof body.version !== 'number') throw AppError.badRequest('缺少 workspaceId 或 version');
+    gate('prompt.version.rollback', c.req.query('confirm') === 'true', { name: c.req.param('name'), version: body.version });
+    const result = await promptsV4.rollbackVersion(body.workspaceId, c.req.param('name'), body.version);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'prompt.version.rollback', targetType: 'prompt_template', targetId: result.templateId, confirmedByUser: true, detail: { name: c.req.param('name'), from: body.version, to: result.version } });
+    return ok(c, result);
+  });
+
+  app.post('/prompts/v4/:name/abtest', async (c) => {
+    const body = await parseJson(c, S.isAbTestCreateRequest, 'abtest');
+    const result = await promptsV4.createABTest({ workspaceId: body.workspaceId, templateName: body.templateName, versionA: body.versionA, versionB: body.versionB, ...(body.name ? { name: body.name } : {}) });
+    eventBus.publishBuffered(EventType.PROMPT_ABTEST_UPDATED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result, 201);
+  });
+
+  app.get('/prompts/abtests', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { tests: await promptsV4.listABTests(workspaceId) });
+  });
+
+  app.post('/prompts/abtests/:id/evaluate', async (c) => {
+    const body = await parseJson(c, S.isAbEvaluationRequest, 'evaluate');
+    const result = await promptsV4.recordEvaluation({ workspaceId: body.workspaceId, abTestId: c.req.param('id'), version: body.version, metric: body.metric, value: body.value, sampleSize: body.sampleSize, ...(body.note ? { note: body.note } : {}) });
+    return ok(c, result, 201);
+  });
+
+  app.post('/prompts/abtests/:id/auto-evaluate', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await promptsV4.autoEvaluate({ workspaceId, abTestId: c.req.param('id') }));
+  });
+
+  app.get('/prompts/abtests/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await promptsV4.report(workspaceId, c.req.param('id')));
+  });
+
+  app.post('/prompts/abtests/:id/finish', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await promptsV4.finishABTest(workspaceId, c.req.param('id')));
+  });
+
+  /* ------------------- Step 4：实验性集群 ------------------- */
+
+  app.get('/cluster/nodes', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const [nodes, policy] = await Promise.all([cluster.nodes.list(), cluster.policies.get(workspaceId)]);
+    const health = await cluster.nodes.healthAll(200);
+    const latest = new Map<string, (typeof health)[number]>();
+    for (const h of health) if (!latest.has(h.nodeId)) latest.set(h.nodeId, h);
+    return ok(c, {
+      nodes: nodes.map((n) => ({ ...n, metrics: latest.get(n.id) ? { cpu: latest.get(n.id)!.cpu, memory: latest.get(n.id)!.memory, gpu: latest.get(n.id)!.gpu, disk: latest.get(n.id)!.disk, network: latest.get(n.id)!.network } : null })),
+      policy,
+    });
+  });
+
+  app.post('/cluster/nodes', async (c) => {
+    requirePhase4('phase4Cluster', '实验性集群');
+    const body = await parseJson(c, S.isClusterNodeRegisterRequest, 'node');
+    const policy = await cluster.policies.get(body.workspaceId);
+    const node = await cluster.nodes.register(
+      {
+        name: body.name,
+        ...(body.role ? { role: body.role as 'worker' } : {}),
+        ...(body.host ? { host: body.host } : {}),
+        ...(body.port === undefined ? {} : { port: body.port }),
+        ...(body.resources ? { resources: body.resources } : {}),
+        ...(body.labels ? { labels: body.labels } : {}),
+      },
+      { maxNodes: policy.maxNodes, allowLoopback: true },
+    );
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'cluster.node.register', targetType: 'cluster_node', targetId: node.id, confirmedByUser: true, detail: { name: node.name, host: node.host, port: node.port } });
+    eventBus.publishBuffered(EventType.CLUSTER_NODE_REGISTERED, { nodeId: node.id, name: node.name }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, { node }, 201);
+  });
+
+  app.delete('/cluster/nodes/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('cluster.node.remove', c.req.query('confirm') === 'true', { nodeId: c.req.param('id') });
+    const result = await cluster.nodes.remove(c.req.param('id'));
+    await audit.record({ workspaceId, actor: 'user', action: 'cluster.node.remove', targetType: 'cluster_node', targetId: c.req.param('id'), confirmedByUser: true, detail: result });
+    return ok(c, result);
+  });
+
+  app.post('/cluster/nodes/:id/heartbeat', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, number> | undefined;
+    if (!S.isClusterHeartbeatRequest(body)) throw AppError.badRequest('心跳指标必须是数字：cpu/memory/gpu/disk/network');
+    const node = await cluster.heartbeat.beat(c.req.param('id'), body as never);
+    return ok(c, { node });
+  });
+
+  app.post('/cluster/sweep', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const policy = await cluster.policies.get(workspaceId);
+    const result = await cluster.monitor.sweep(policy.heartbeatTimeoutMs);
+    return ok(c, { offline: result.offline.map((n) => ({ id: n.id, name: n.name })), online: result.online.map((n) => ({ id: n.id, name: n.name })) });
+  });
+
+  app.get('/cluster/status', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const requested = c.req.query('mode') === 'single' ? 'single' : 'cluster';
+    return ok(c, await cluster.status(workspaceId, requested));
+  });
+
+  app.get('/cluster/health', async (c) => ok(c, await cluster.monitor.healthSummary()));
+
+  app.get('/cluster/elections', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { elections: await cluster.elections.history(Number(c.req.query('limit') ?? 20)), term: await cluster.elections.currentTerm() });
+  });
+
+  app.post('/cluster/elections', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('cluster.election.force', c.req.query('confirm') === 'true', {});
+    const result = await cluster.elections.elect({ reason: 'manual' });
+    await audit.record({ workspaceId, actor: 'user', action: 'cluster.election.force', targetType: 'cluster', targetId: 'local', confirmedByUser: true, detail: { term: result.term, leaderNodeId: result.leaderNodeId, reason: result.reason, changed: result.changed } });
+    return ok(c, result);
+  });
+
+  app.get('/cluster/tasks', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { tasks: await cluster.distributor.listTasks(workspaceId, Number(c.req.query('limit') ?? 100)) });
+  });
+
+  app.post('/cluster/tasks/distribute', async (c) => {
+    const body = await parseJson(c, S.isShardDistributeRequest, 'distribute');
+    const policy = await cluster.policies.get(body.workspaceId);
+    const online = (await cluster.nodes.list()).filter((n) => n.status === 'online');
+    const shards = shardAuto(body.items, body.shardCount ?? policy.maxParallelTasks, typeof body.need?.cpu === 'number' ? () => 1 : undefined);
+    const result = await cluster.distributor.distribute({
+      workspaceId: body.workspaceId,
+      taskId: body.taskId,
+      ...(body.goalId ? { goalId: body.goalId } : {}),
+      shards,
+      nodes: online,
+      ...(body.labels ? { labels: body.labels } : {}),
+      ...(body.need ? { need: body.need } : {}),
+      maxParallel: policy.maxParallelTasks,
+    });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'cluster.task.distribute', targetType: 'cluster_task', targetId: body.taskId, confirmedByUser: true, detail: { shards: shards.length, assigned: result.assignments.length, skipped: result.skipped.length } });
+    eventBus.publishBuffered(EventType.CLUSTER_SHARD_UPDATED, { taskId: body.taskId, assignments: result.assignments }, { workspaceId: body.workspaceId, goalId: body.goalId ?? null, taskId: body.taskId });
+    return ok(c, result, 202);
+  });
+
+  app.post('/cluster/shards/:id/complete', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { ok?: boolean; result?: Record<string, unknown>; error?: string };
+    if (typeof body.ok !== 'boolean') throw AppError.badRequest('缺少 ok（布尔值）');
+    const result = await cluster.distributor.complete(c.req.param('id'), { ok: body.ok, ...(body.result ? { result: body.result } : {}), ...(body.error ? { error: body.error } : {}) });
+    return ok(c, result);
+  });
+
+  app.post('/cluster/tasks/:id/cancel', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await cluster.distributor.cancelTask(workspaceId, c.req.param('id'));
+    if (!result) throw AppError.notFound(`集群任务不存在: ${c.req.param('id')}`);
+    return ok(c, { task: result });
+  });
+
+  app.get('/cluster/policy', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { policy: await cluster.policies.get(workspaceId) });
+  });
+
+  app.patch('/cluster/policy', async (c) => {
+    const body = await parseJson(c, S.isClusterPolicyUpdateRequest, 'policy');
+    gate('cluster.policy.update', c.req.query('confirm') === 'true', {});
+    const policy = await cluster.policies.update(body.workspaceId, {
+      ...(body.maxNodes === undefined ? {} : { maxNodes: body.maxNodes }),
+      ...(body.maxParallelTasks === undefined ? {} : { maxParallelTasks: body.maxParallelTasks }),
+      ...(body.resourceLimits === undefined ? {} : { resourceLimits: body.resourceLimits }),
+      ...(body.fallbackEnabled === undefined ? {} : { fallbackEnabled: body.fallbackEnabled }),
+      ...(body.heartbeatTimeoutMs === undefined ? {} : { heartbeatTimeoutMs: body.heartbeatTimeoutMs }),
+    });
+    await cluster.syncHeartbeat(body.workspaceId);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'cluster.policy.update', targetType: 'cluster_policy', targetId: policy.id, confirmedByUser: true, detail: { maxNodes: policy.maxNodes, maxParallelTasks: policy.maxParallelTasks, fallbackEnabled: policy.fallbackEnabled } });
+    return ok(c, { policy });
+  });
+
+  app.post('/cluster/bootstrap', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string };
+    if (!body.workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await cluster.ensureBootstrapped(body.workspaceId);
+    return ok(c, result);
+  });
+
+  /* ------------------- Step 5：多 Agent 并行 ------------------- */
+
+  app.get('/agents/pool', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const list = await pools.list(workspaceId);
+    const withBusy = await Promise.all(
+      list.map(async (p) => {
+        const busy = await pools.busyAgents(workspaceId, p.role);
+        return { ...p, busy: busy.length, headroom: Math.max(0, p.activeAgents - busy.length) };
+      }),
+    );
+    return ok(c, { pools: withBusy });
+  });
+
+  app.post('/agents/pool', async (c) => {
+    const body = await parseJson(c, S.isAgentPoolCreateRequest, 'pool');
+    const pool = await pools.create({ workspaceId: body.workspaceId, name: body.name, role: body.role, ...(body.minAgents === undefined ? {} : { minAgents: body.minAgents }), ...(body.maxAgents === undefined ? {} : { maxAgents: body.maxAgents }), ...(body.model === undefined ? {} : { model: body.model }), ...(body.tools ? { tools: body.tools } : {}) });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'agent.pool.create', targetType: 'agent_pool', targetId: pool.id, confirmedByUser: true, detail: { role: pool.role, min: pool.minAgents, max: pool.maxAgents } });
+    return ok(c, { pool }, 201);
+  });
+
+  app.post('/agents/pool/scale', async (c) => {
+    const body = await parseJson(c, S.isAgentPoolScaleRequest, 'scale');
+    const role = String(c.req.query('role') ?? '');
+    if (!role) throw AppError.badRequest('缺少 role 查询参数');
+    gate('agent.pool.scale', c.req.query('confirm') === 'true', { role, target: body.target });
+    const result = await pools.scale({ workspaceId: body.workspaceId, idOrRole: role, target: body.target });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'agent.pool.scale', targetType: 'agent_pool', targetId: result.pool.id, confirmedByUser: true, detail: { role, target: body.target, changed: result.changed } });
+    eventBus.publishBuffered(EventType.AGENT_POOL_UPDATED, result, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.patch('/agents/pool/:id', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const workspaceId = String(body.workspaceId ?? '');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const pool = await pools.update(workspaceId, c.req.param('id'), body as never);
+    return ok(c, { pool });
+  });
+
+  app.get('/agents/routes', async (c) => {
+    const taskId = c.req.query('taskId');
+    if (taskId) return ok(c, { routes: await routeRecorder.list(taskId) });
+    return ok(c, { routes: await routeRecorder.listRecent(Number(c.req.query('limit') ?? 100)) });
+  });
+
+  app.get('/agents/models', (c) => ok(c, { models: Object.entries(MODEL_PRICES).map(([model, price]) => ({ model, inputPricePerM: price.in, outputPricePerM: price.out })) }));
+
+  app.post('/agents/orchestrate', async (c) => {
+    const body = await parseJson(c, S.isOrchestrateRequest, 'orchestrate');
+    const poolList = await pools.list(body.workspaceId);
+    const configuredMax = body.maxParallel ?? 4;
+    const budget = await costBudgetFor(body.workspaceId);
+    const result = body.dryRun === false
+      ? await orchestrator.run({
+          workspaceId: body.workspaceId,
+          ...(body.goalId ? { goalId: body.goalId } : {}),
+          nodes: body.nodes as never,
+          ...(body.taskTexts ? { taskTexts: body.taskTexts } : {}),
+          ...(body.taskKinds ? { taskKinds: body.taskKinds } : {}),
+          pools: poolList as never,
+          modelCandidates: Object.entries(MODEL_PRICES).map(([model, price]) => ({ model, contextWindow: model.includes('4.1') ? 1_000_000 : 128_000, inputPricePerM: price.in, outputPricePerM: price.out, strengths: ['general'], longContext: model.includes('4.1') })),
+          toolCandidates: [
+            { name: 'fs.read', keywords: ['文件', '读取', 'file'] },
+            { name: 'fs.write', keywords: ['写入', '生成文件', 'save'], dangerous: true },
+            { name: 'web.fetch', keywords: ['联网', '检索', '搜索', 'url'], network: true },
+            { name: 'db.query', keywords: ['数据库', '查询', 'sql'] },
+          ],
+          networkAllowed: body.networkAllowed === true,
+          configuredMaxParallel: configuredMax,
+          budget,
+        })
+      : await orchestrator.plan({
+          workspaceId: body.workspaceId,
+          ...(body.goalId ? { goalId: body.goalId } : {}),
+          nodes: body.nodes as never,
+          ...(body.taskTexts ? { taskTexts: body.taskTexts } : {}),
+          ...(body.taskKinds ? { taskKinds: body.taskKinds } : {}),
+          pools: poolList as never,
+          modelCandidates: Object.entries(MODEL_PRICES).map(([model, price]) => ({ model, contextWindow: model.includes('4.1') ? 1_000_000 : 128_000, inputPricePerM: price.in, outputPricePerM: price.out, strengths: ['general'], longContext: model.includes('4.1') })),
+          toolCandidates: [],
+          networkAllowed: body.networkAllowed === true,
+          configuredMaxParallel: configuredMax,
+          budget,
+        });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'agent.orchestrate', targetType: 'goal', targetId: body.goalId ?? null, confirmedByUser: true, detail: { tasks: body.nodes.length, dispatched: result.dispatched.length, parallelism: result.parallelism.limit, dryRun: body.dryRun !== false } });
+    return ok(c, result);
+  });
+
+  app.get('/aggregated/results', async (c) => {
+    const taskId = c.req.query('taskId');
+    if (!taskId) throw AppError.badRequest('缺少 taskId');
+    return ok(c, { results: await aggregations.get(taskId) });
+  });
+
+  app.post('/aggregated/:id/resolve', async (c) => {
+    const body = await parseJson(c, S.isAggregateResolveRequest, 'resolve');
+    gate('aggregated.resolve', c.req.query('confirm') === 'true', { id: c.req.param('id') });
+    const result = await aggregations.resolve({ workspaceId: body.workspaceId, id: c.req.param('id'), decisions: body.decisions });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'aggregated.resolve', targetType: 'aggregated_result', targetId: c.req.param('id'), confirmedByUser: true, detail: result });
+    return ok(c, result);
+  });
+
+  app.get('/costs', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const goalId = c.req.query('goalId');
+    if (goalId) return ok(c, await costs.byGoal(workspaceId, goalId));
+    return ok(c, await costs.summary(workspaceId, await costBudgetFor(workspaceId)));
+  });
+
+  app.post('/costs', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    const workspaceId = String(body.workspaceId ?? '');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    if (typeof body.model !== 'string' || typeof body.tokensIn !== 'number' || typeof body.tokensOut !== 'number') {
+      throw AppError.badRequest('model / tokensIn / tokensOut 必填');
+    }
+    const result = await costs.record(
+      { workspaceId, goalId: (body.goalId as string) ?? null, taskId: (body.taskId as string) ?? null, agentId: (body.agentId as string) ?? null, model: body.model, tokensIn: body.tokensIn, tokensOut: body.tokensOut, ...(typeof body.costUsd === 'number' ? { costUsd: body.costUsd } : {}) },
+      await costBudgetFor(workspaceId),
+    );
+    eventBus.publishBuffered(result.state === 'none' ? EventType.COST_RECORDED : EventType.COST_BUDGET_WARNING, result, { workspaceId, goalId: null, taskId: null });
+    return ok(c, result, 201);
+  });
+
+  /* ------------------- Step 6：企业安全与审计 ------------------- */
+
+  app.get('/rbac/permissions', (c) => ok(c, { permissions: rbac.permissionCatalog(), all: ALL_PERMISSIONS }));
+
+  app.get('/rbac/roles', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    await rbac.ensureBuiltinRoles(workspaceId);
+    return ok(c, { roles: await rbac.listRoles(workspaceId) });
+  });
+
+  app.post('/rbac/roles', async (c) => {
+    requirePhase4('phase4Enterprise', '企业安全');
+    const body = await parseJson(c, S.isRbacRoleCreateRequest, 'role');
+    const role = await rbac.createRole({ workspaceId: body.workspaceId, name: body.name, permissions: body.permissions });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'rbac.role.create', targetType: 'role', targetId: role.id, confirmedByUser: true, detail: { name: role.name, permissions: role.permissions } });
+    eventBus.publishBuffered(EventType.RBAC_ROLE_UPDATED, { name: role.name }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, { role }, 201);
+  });
+
+  app.patch('/rbac/roles/:name', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; permissions?: string[] };
+    if (!body.workspaceId || !Array.isArray(body.permissions)) throw AppError.badRequest('缺少 workspaceId 或 permissions');
+    const role = await rbac.updateRole(body.workspaceId, c.req.param('name'), body.permissions);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'rbac.role.update', targetType: 'role', targetId: role.id, confirmedByUser: true, detail: { name: role.name, permissions: role.permissions } });
+    eventBus.publishBuffered(EventType.RBAC_ROLE_UPDATED, { name: role.name }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, { role });
+  });
+
+  app.delete('/rbac/roles/:name', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('rbac.role.delete', c.req.query('confirm') === 'true', { name: c.req.param('name') });
+    const result = await rbac.deleteRole(workspaceId, c.req.param('name'));
+    await audit.record({ workspaceId, actor: 'user', action: 'rbac.role.delete', targetType: 'role', targetId: result.removed, confirmedByUser: true, detail: result });
+    return ok(c, result);
+  });
+
+  app.post('/rbac/assign', async (c) => {
+    const body = await parseJson(c, S.isRbacAssignRequest, 'assign');
+    gate('rbac.assign', c.req.query('confirm') === 'true', { userId: body.userId, role: body.role });
+    await rbac.ensureBuiltinRoles(body.workspaceId);
+    const result = await rbac.assign({ workspaceId: body.workspaceId, userId: body.userId, roleNameOrId: body.role });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'rbac.assign', targetType: 'user_role', targetId: body.userId, confirmedByUser: true, detail: { role: result.role, permissions: result.permissions } });
+    return ok(c, result);
+  });
+
+  app.post('/rbac/unassign', async (c) => {
+    const body = await parseJson(c, S.isRbacAssignRequest, 'unassign');
+    const result = await rbac.unassign({ workspaceId: body.workspaceId, userId: body.userId, roleNameOrId: body.role });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'rbac.unassign', targetType: 'user_role', targetId: body.userId, confirmedByUser: true, detail: { role: result.role } });
+    return ok(c, result);
+  });
+
+  app.get('/rbac/users', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { users: await rbac.listUserRoles(workspaceId) });
+  });
+
+  app.get('/rbac/check', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    const userId = c.req.query('userId');
+    const permission = c.req.query('permission');
+    if (!workspaceId || !userId || !permission) throw AppError.badRequest('缺少 workspaceId / userId / permission');
+    if (!(permission in PERMISSIONS)) throw AppError.badRequest(`未知权限点：${permission}`);
+    return ok(c, await rbac.check({ workspaceId, userId, permission: permission as keyof typeof PERMISSIONS }));
+  });
+
+  app.get('/sso/config', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await sso.describe(workspaceId));
+  });
+
+  app.post('/sso/config', async (c) => {
+    const body = await parseJson(c, S.isSsoConfigRequest, 'sso');
+    await rbac.ensureBuiltinRoles(body.workspaceId);
+    const roles = (await rbac.listRoles(body.workspaceId)).map((r) => r.name);
+    const result = await sso.upsert(body.workspaceId, {
+      ...(body.protocol ? { protocol: body.protocol as 'oidc' } : {}),
+      issuer: body.issuer,
+      clientId: body.clientId ?? '',
+      clientSecretRef: body.clientSecretRef,
+      redirectUri: body.redirectUri ?? '',
+      ...(body.groupMapping ? { groupMapping: body.groupMapping } : {}),
+      ...(body.enabled === undefined ? {} : { enabled: body.enabled }),
+    }, roles);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'sso.config.update', targetType: 'sso_config', targetId: 'sso', confirmedByUser: true, detail: { protocol: result.protocol, issuer: result.issuer, clientSecretRef: result.clientSecretRef } });
+    eventBus.publishBuffered(EventType.SSO_CONFIG_UPDATED, { protocol: result.protocol }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result);
+  });
+
+  app.post('/sso/enable', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; enabled?: boolean };
+    if (!body.workspaceId || typeof body.enabled !== 'boolean') throw AppError.badRequest('缺少 workspaceId 或 enabled');
+    gate('sso.enable', c.req.query('confirm') === 'true', {});
+    const result = await sso.setEnabled(body.workspaceId, body.enabled);
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'sso.enable', targetType: 'sso_config', targetId: 'sso', confirmedByUser: true, detail: { enabled: body.enabled } });
+    return ok(c, result);
+  });
+
+  app.delete('/sso/config', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    gate('sso.remove', c.req.query('confirm') === 'true', {});
+    const result = await sso.remove(workspaceId);
+    await audit.record({ workspaceId, actor: 'user', action: 'sso.remove', targetType: 'sso_config', targetId: 'sso', confirmedByUser: true, detail: {} });
+    return ok(c, result);
+  });
+
+  app.get('/sso/auth-url', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await sso.buildAuthUrl(workspaceId));
+  });
+
+  app.get('/audit/logs', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const logs = await auditQuery.list({
+      workspaceId,
+      ...(c.req.query('from') ? { from: c.req.query('from') as string } : {}),
+      ...(c.req.query('to') ? { to: c.req.query('to') as string } : {}),
+      ...(c.req.query('action') ? { action: c.req.query('action') as string } : {}),
+      ...(c.req.query('actor') ? { actor: c.req.query('actor') as string } : {}),
+      ...(c.req.query('dangerousOnly') === 'true' ? { dangerousOnly: true } : {}),
+      limit: Number(c.req.query('limit') ?? 100),
+    });
+    return ok(c, { logs, stats: await auditQuery.stats(workspaceId) });
+  });
+
+  app.post('/audit/export', async (c) => {
+    const body = await parseJson(c, S.isAuditExportRequest, 'export');
+    gate('audit.export', c.req.query('confirm') === 'true', { from: body.from, to: body.to });
+    const result = await complianceExport.exportAudit({ workspaceId: body.workspaceId, from: body.from, to: body.to, ...(body.actor ? { actor: body.actor } : {}) });
+    eventBus.publishBuffered(EventType.AUDIT_EXPORTED, { exportId: result.exportId, rowCount: result.rowCount }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, result, 201);
+  });
+
+  app.get('/audit/exports', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { exports: await complianceExport.listExports(workspaceId) });
+  });
+
+  app.get('/audit/exports/:id/download', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const file = await complianceExport.readExport(workspaceId, c.req.param('id'));
+    return new Response(new Uint8Array(file.content), {
+      headers: {
+        'content-type': 'application/x-ndjson; charset=utf-8',
+        'content-disposition': `attachment; filename="${file.fileName}"`,
+        'content-length': String(file.content.length),
+      },
+    });
+  });
+
+  app.get('/compliance/mask-rules', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { rules: await dataMask.listRules(workspaceId), builtin: dataMask.builtinCatalog() });
+  });
+
+  app.post('/compliance/mask-rules', async (c) => {
+    const body = await parseJson(c, S.isMaskRuleRequest, 'mask');
+    const rule = await dataMask.upsertRule({ workspaceId: body.workspaceId, field: body.field, strategy: body.strategy as 'full', ...(body.target ? { target: body.target } : {}), ...(body.enabled === undefined ? {} : { enabled: body.enabled }) });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'compliance.mask.upsert', targetType: 'data_mask_rule', targetId: rule.id, confirmedByUser: true, detail: { field: rule.field, strategy: rule.strategy, target: rule.target } });
+    return ok(c, { rule }, 201);
+  });
+
+  app.delete('/compliance/mask-rules/:id', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await dataMask.deleteRule(workspaceId, c.req.param('id'));
+    await audit.record({ workspaceId, actor: 'user', action: 'compliance.mask.delete', targetType: 'data_mask_rule', targetId: c.req.param('id'), confirmedByUser: true, detail: result });
+    return ok(c, result);
+  });
+
+  app.get('/compliance/mask-preview', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, await auditQuery.previewMask(workspaceId, Number(c.req.query('limit') ?? 10)));
+  });
+
+  app.get('/compliance/retention', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { policies: await retention.list(workspaceId), dataTypes: RETENTION_DATA_TYPES });
+  });
+
+  app.post('/compliance/retention', async (c) => {
+    const body = await parseJson(c, S.isRetentionUpsertRequest, 'retention');
+    const policy = await retention.upsert({ workspaceId: body.workspaceId, dataType: body.dataType, retentionDays: body.retentionDays, ...(body.action ? { action: body.action as 'delete' } : {}), ...(body.enabled === undefined ? {} : { enabled: body.enabled }) });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'compliance.retention.upsert', targetType: 'retention_policy', targetId: policy.id, confirmedByUser: true, detail: { dataType: policy.dataType, retentionDays: policy.retentionDays, action: policy.action } });
+    return ok(c, { policy }, 201);
+  });
+
+  app.delete('/compliance/retention/:dataType', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    const result = await retention.remove(workspaceId, c.req.param('dataType'));
+    await audit.record({ workspaceId, actor: 'user', action: 'compliance.retention.delete', targetType: 'retention_policy', targetId: c.req.param('dataType'), confirmedByUser: true, detail: result });
+    return ok(c, result);
+  });
+
+  /**
+   * 执行保留策略。
+   * 默认 dryRun=true：先给用户看「会删多少」，确认后（confirm=true）才真删。
+   */
+  app.post('/compliance/retention/apply', async (c) => {
+    const body = await parseJson(c, S.isRetentionApplyRequest, 'apply');
+    const dryRun = body.dryRun !== false;
+    if (!dryRun) gate('retention.apply', c.req.query('confirm') === 'true', { dataType: body.dataType ?? 'all' });
+    const results = await retention.apply(
+      { workspaceId: body.workspaceId, ...(body.dataType ? { dataType: body.dataType as never } : {}), dryRun },
+      buildRetentionExecutors(db),
+    );
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'compliance.retention.apply', targetType: 'retention_policy', targetId: body.dataType ?? 'all', confirmedByUser: !dryRun, detail: { dryRun, results } });
+    if (!dryRun) eventBus.publishBuffered(EventType.RETENTION_APPLIED, { results }, { workspaceId: body.workspaceId, goalId: null, taskId: null });
+    return ok(c, { dryRun, results });
+  });
+
+  app.post('/compliance/package', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as { workspaceId?: string; from?: string; to?: string };
+    if (!body.workspaceId || !body.from || !body.to) throw AppError.badRequest('缺少 workspaceId / from / to');
+    const maskRules = (await dataMask.listRules(body.workspaceId)).map((r) => ({ field: r.field, strategy: r.strategy, target: r.target }));
+    const retentionPolicies = (await retention.list(body.workspaceId)).map((p) => ({ dataType: p.dataType, retentionDays: p.retentionDays, action: p.action, enabled: p.enabled }));
+    const pkg = await complianceExport.buildPackage({ workspaceId: body.workspaceId, from: body.from, to: body.to, maskRules, retentionPolicies });
+    await audit.record({ workspaceId: body.workspaceId, actor: 'user', action: 'compliance.package.build', targetType: 'compliance_package', targetId: body.workspaceId, confirmedByUser: true, detail: { auditCount: pkg.summary.auditCount } });
+    return ok(c, pkg);
+  });
+
   /* ---------------------------- 错误兜底 ---------------------------- */
+
   app.notFound((c) => fail(c, AppError.notFound(`接口不存在: ${c.req.method} ${c.req.path}`)));
   app.onError((err, c) => {
     if (!(err instanceof AppError)) console.error('[unhandled]', err);
@@ -1329,6 +2245,66 @@ export function createApp(deps: AppDeps = {}) {
   });
 
   return app;
+}
+
+/** 预算读取：从环境变量读取工作区级 Token 预算（美元），未配置则不限 */
+async function costBudgetFor(_workspaceId: string) {
+  const raw = Number(process.env.WORKBENCH_TOKEN_BUDGET_USD ?? '0');
+  return { limitUsd: Number.isFinite(raw) && raw > 0 ? raw : 0, warnRatio: 0.8 };
+}
+
+/**
+ * 保留策略执行器映射。
+ * 表名在此处**白名单写死**，不接受任何外部输入拼表名（防注入）；
+ * dryRun 只做 count，不做任何删除。
+ */
+function buildRetentionExecutors(db: Db): Partial<Record<RetentionDataType, (cutoff: string, action: string, dryRun: boolean) => Promise<{ scanned: number; affected: number }>>> {
+  const tableFor: Record<string, string> = {
+    audit_logs: 'audit_logs',
+    schedule_runs: 'schedule_runs',
+    plugin_call_logs: 'plugin_call_logs',
+    cost_records: 'cost_records',
+    conversations: 'conversations',
+    office_documents: 'office_documents',
+    research_reports: 'research_reports',
+    deployment_logs: 'website_deployments',
+  };
+  const columnFor: Record<string, string> = {
+    audit_logs: 'created_at',
+    schedule_runs: 'started_at',
+    plugin_call_logs: 'created_at',
+    cost_records: 'created_at',
+    conversations: 'created_at',
+    office_documents: 'parsed_at',
+    research_reports: 'created_at',
+    deployment_logs: 'created_at',
+  };
+  const out: Record<string, (cutoff: string, action: string, dryRun: boolean) => Promise<{ scanned: number; affected: number }>> = {};
+  for (const [dataType, table] of Object.entries(tableFor)) {
+    const column = columnFor[dataType]!;
+    out[dataType] = async (cutoff, action, dryRun) => {
+      const sqlite = getSqlite();
+      const countRow = sqlite.prepare(`SELECT COUNT(*) AS c FROM ${table} WHERE ${column} < ?`).get(cutoff) as { c: number } | undefined;
+      const scanned = countRow?.c ?? 0;
+      if (dryRun || scanned === 0) return { scanned, affected: 0 };
+      if (action === 'delete') {
+        sqlite.prepare(`DELETE FROM ${table} WHERE ${column} < ?`).run(cutoff);
+      } else if (action === 'anonymize') {
+        // 只对有明确「可匿名化字段」的表做处理；否则退化为「不删不改」，由用户选择 delete
+        if (dataType === 'plugin_call_logs') {
+          sqlite.prepare(`UPDATE plugin_call_logs SET args = '{}' WHERE ${column} < ?`).run(cutoff);
+        } else {
+          return { scanned, affected: 0 };
+        }
+      } else {
+        // archive：不删除，仅记录（真实归档动作会写 audit_logs）
+        return { scanned, affected: 0 };
+      }
+      void db;
+      return { scanned, affected: scanned };
+    };
+  }
+  return out as Partial<Record<RetentionDataType, (cutoff: string, action: string, dryRun: boolean) => Promise<{ scanned: number; affected: number }>>>;
 }
 
 /**

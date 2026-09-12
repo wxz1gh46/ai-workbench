@@ -16,6 +16,7 @@ import {
   Settings,
   Terminal,
   Target,
+  Shield,
 } from 'lucide-react';
 import { useAppStore } from '@/stores/app-store';
 import { Toasts } from '@/components/Toasts';
@@ -38,8 +39,18 @@ import { DatabasePanelPage } from '@/pages/DatabasePanelPage';
 import { DashboardEditorPage } from '@/pages/DashboardEditorPage';
 import { ScheduleManagerPage } from '@/pages/ScheduleManagerPage';
 import { NotificationSettingsPage } from '@/pages/NotificationSettingsPage';
+import { PluginMarketPage } from '@/pages/PluginMarketPage';
+import { PaidDataPanelPage } from '@/pages/PaidDataPanelPage';
+import { PromptWorkbenchPage } from '@/pages/PromptWorkbenchPage';
+import { ClusterViewPage } from '@/pages/ClusterViewPage';
+import { SecurityCenterPage } from '@/pages/SecurityCenterPage';
 
 type TabKey =
+  | 'pluginMarket'
+  | 'paidData'
+  | 'promptWorkbench'
+  | 'clusterView'
+  | 'securityCenter'
   | 'deploy'
   | 'database'
   | 'boardEditor'
@@ -59,6 +70,11 @@ type TabKey =
   | 'settings';
 
 const TABS: { key: TabKey; label: string; icon: typeof Target; group?: string }[] = [
+  { key: 'pluginMarket', label: '插件市场', icon: Puzzle, group: 'Phase 4' },
+  { key: 'paidData', label: '付费数据库', icon: Database, group: 'Phase 4' },
+  { key: 'promptWorkbench', label: '提示词工作台', icon: Terminal, group: 'Phase 4' },
+  { key: 'clusterView', label: '集群视图', icon: Boxes, group: 'Phase 4' },
+  { key: 'securityCenter', label: '安全中心', icon: Shield, group: 'Phase 4' },
   { key: 'deploy', label: '部署中心', icon: Cloud, group: 'Phase 3' },
   { key: 'database', label: '数据库面板', icon: Database, group: 'Phase 3' },
   { key: 'boardEditor', label: '看板编辑器', icon: LayoutDashboard, group: 'Phase 3' },
@@ -143,6 +159,11 @@ export default function App() {
       </nav>
 
       <main className="min-h-0 flex-1 overflow-hidden p-3">
+        {tab === 'pluginMarket' && <PluginMarketPage />}
+        {tab === 'paidData' && <PaidDataPanelPage />}
+        {tab === 'promptWorkbench' && <PromptWorkbenchPage />}
+        {tab === 'clusterView' && <ClusterViewPage />}
+        {tab === 'securityCenter' && <SecurityCenterPage />}
         {tab === 'deploy' && <DeployCenterPage />}
         {tab === 'database' && <DatabasePanelPage />}
         {tab === 'boardEditor' && <DashboardEditorPage />}

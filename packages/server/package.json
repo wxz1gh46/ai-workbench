@@ -27,7 +27,8 @@
     "test:schedule": "node --test --experimental-transform-types \"src/schedule/**/*.test.ts\"",
     "test:dashboard": "node --test --experimental-transform-types \"src/dashboard/**/*.test.ts\"",
     "test:database": "node --test --experimental-transform-types \"src/database/**/*.test.ts\"",
-    "verify:phase3": "tsx scripts/verify-phase3.ts"
+    "verify:phase3": "tsx scripts/verify-phase3.ts",
+    "verify:phase4": "tsx scripts/verify-phase4.ts"
   },
   "dependencies": {
     "@ai/shared": "workspace:*",

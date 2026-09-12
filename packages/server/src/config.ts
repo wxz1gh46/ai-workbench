@@ -83,8 +83,16 @@ export const config = {
     phase3Database: true,
     phase3Dashboard: true,
     phase3Notify: true,
-    phase4Cluster: false,
-    phase4PaidPlugins: false,
+    /**
+     * Phase 4 功能开关。
+     *
+     * 与 Phase 3 的策略一致：默认开启，但都可以单独关闭。
+     * 关闭后接口返回「未启用」而**数据全保留** —— 这是「每个 Step 可独立回滚」的前提。
+     */
+    phase4Cluster: env('PHASE4_CLUSTER', '1') !== '0',
+    phase4PaidPlugins: env('PHASE4_PAID_PLUGINS', '1') !== '0',
+    phase4Prompt: env('PHASE4_PROMPT', '1') !== '0',
+    phase4Enterprise: env('PHASE4_ENTERPRISE', '1') !== '0',
   },
 
   logLevel: env('LOG_LEVEL', 'info'),
