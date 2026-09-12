@@ -117,6 +117,9 @@ CREATE TABLE IF NOT EXISTS research_jobs (
   stage TEXT NOT NULL DEFAULT '',
   output_formats TEXT NOT NULL DEFAULT '["markdown"]',
   allow_network INTEGER NOT NULL DEFAULT 0,
+  source_count INTEGER NOT NULL DEFAULT 0,
+  claim_count INTEGER NOT NULL DEFAULT 0,
+  disputed_count INTEGER NOT NULL DEFAULT 0,
   error TEXT,
   created_at TEXT NOT NULL,
   finished_at TEXT

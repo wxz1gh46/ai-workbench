@@ -77,7 +77,7 @@ export const config = {
   features: {
     phase2GoalMode: true,
     phase2Office: true,
-    phase2Research: false,
+    phase2Research: true,
     phase3Deploy: false,
     phase3Schedule: true,
     phase4Cluster: false,

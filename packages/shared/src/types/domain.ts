@@ -757,6 +757,10 @@ export interface ResearchJob {
   queries: string[];
   progress: number;
   stage: string;
+  /** 期望的导出格式 */
+  outputFormats: OfficeFormat[];
+  /** 用户是否显式允许联网检索 */
+  allowNetwork: boolean;
   sourceCount: number;
   claimCount: number;
   disputedCount: number;

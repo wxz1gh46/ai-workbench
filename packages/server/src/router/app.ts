@@ -7,6 +7,7 @@ import { runMigrations } from '../db/migrate.ts';
 import { GoalService } from '../agent/goal-service.ts';
 import { GoalEngine } from '../goals/goalEngine.ts';
 import { OfficeService } from '../office/officeService.ts';
+import { ResearchEngine } from '../research/researchEngine.ts';
 import { MemoryService } from '../agent/memory.ts';
 import { ContextManager } from '../context/contextManager.ts';
 import { modelRouter } from '../agent/model-router.ts';
@@ -40,6 +41,7 @@ export function createApp(deps: AppDeps = {}) {
   const goalService = new GoalService(db);
   const goalEngine = new GoalEngine(db);
   const office = new OfficeService(db);
+  const research = new ResearchEngine(db);
   const memory = new MemoryService(db);
   const context = new ContextManager(db);
   const files = new FileService(db);
@@ -554,19 +556,82 @@ export function createApp(deps: AppDeps = {}) {
     return ok(c, result, 201);
   });
 
-  /* ---------------------------- 深度研究 --------------------------- */
-  app.post('/research', async (c) => {
-    const body = await parseJson(c, S.isResearchRequest, 'research');
-    if (!config.features.phase2Research) {
-      throw AppError.badRequest('深度研究将在 Phase 2 交付（当前无联网检索与多源验证能力），请先使用目标模式');
-    }
-    const result = await goalService.createGoal({
-      workspaceId: body.workspaceId,
-      objective: `深度研究：${body.topic}（深度：${body.depth ?? 'standard'}）`,
-      acceptanceCriteria: ['多源交叉验证', '给出可追溯引用', `产出 ${(body.outputFormats ?? ['markdown']).join(' / ')}`],
-    });
-    return ok(c, result, 201);
+  /* ------------------- Phase 2：深度研究（ResearchEngine） -------------- */
+
+  /** GET /research/capability —— 告知 UI 当前可用能力（未配置检索端点则不联网） */
+  app.get('/research/capability', (c) => ok(c, research.capability()));
+
+  app.get('/research', async (c) => {
+    const workspaceId = c.req.query('workspaceId');
+    if (!workspaceId) throw AppError.badRequest('缺少 workspaceId');
+    return ok(c, { jobs: await research.list(workspaceId) });
   });
+
+  /** POST /research —— 创建并异步执行深度研究 */
+  app.post('/research', async (c) => {
+    const body = await parseJson(c, S.isCreateResearchRequestV2, 'research');
+    if (!config.features.phase2Research) {
+      throw AppError.badRequest('深度研究当前未启用（通过 PHASE2_RESEARCH=1 开启）');
+    }
+    // 联网必须用户显式允许；未允许时不发起任何外部请求
+    const job = await research.create({
+      workspaceId: body.workspaceId,
+      topic: body.topic,
+      ...(body.depth ? { depth: body.depth } : {}),
+      ...(body.outputFormats ? { outputFormats: body.outputFormats } : {}),
+      allowNetwork: body.allowNetwork === true,
+      ...(body.maxSources !== undefined ? { maxSources: body.maxSources } : {}),
+    });
+    return ok(c, { job }, 201);
+  });
+
+  app.get('/research/:id', async (c) => {
+    const id = c.req.param('id');
+    const [job, sources, claims, report] = await Promise.all([
+      research.get(id),
+      research.listSources(id),
+      research.listClaims(id),
+      research.getReport(id),
+    ]);
+    return ok(c, { job, sources, claims, report });
+  });
+
+  app.get('/research/:id/report', async (c) => {
+    const id = c.req.param('id');
+    const report = await research.getReport(id);
+    if (!report) throw AppError.notFound('报告尚未生成（研究可能仍在进行或已失败）');
+    return ok(c, { job: await research.get(id), report });
+  });
+
+  /** GET /research/:id/export?format=markdown —— 直接下载报告 */
+  app.get('/research/:id/export', async (c) => {
+    const id = c.req.param('id');
+    const report = await research.getReport(id);
+    if (!report) throw AppError.notFound('报告尚未生成');
+    const job = await research.get(id);
+    const name = `research-${job.topic.replace(/[^\w\u4e00-\u9fff-]/g, '_').slice(0, 40)}.md`;
+    return new Response(new TextEncoder().encode(report.markdown), {
+      headers: {
+        'content-type': 'text/markdown; charset=utf-8',
+        'content-disposition': `attachment; filename="${encodeURIComponent(name)}"`,
+      },
+    });
+  });
+
+  /** POST /research/:id/publish —— 发布为自包含网页 */
+  app.post('/research/:id/publish', async (c) => {
+    const body = (await c.req.json().catch(() => ({}))) as Record<string, unknown>;
+    if (!S.isPublishResearchRequest({ ...body, workspaceId: body.workspaceId ?? 'x' })) {
+      // workspaceId 从 job 推导，这里只校验 public 字段
+      if (body.public !== undefined && typeof body.public !== 'boolean') {
+        throw AppError.badRequest('public 必须是布尔值');
+      }
+    }
+    const result = await research.publish(c.req.param('id'), { public: body.public === true });
+    return ok(c, result);
+  });
+
+  app.post('/research/:id/cancel', async (c) => ok(c, { job: await research.cancel(c.req.param('id')) }));
 
   /* ----------------------------- 网站部署 -------------------------- */
   app.post('/website/deploy', async (c) => {

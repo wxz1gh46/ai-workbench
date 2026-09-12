@@ -222,11 +222,12 @@ test('危险操作缺少用户确认时被拒绝', async () => {
   assert.equal(body.error.code, 'BAD_REQUEST');
 });
 
-test('Phase 2/3 未交付能力返回明确说明而非静默失败', async () => {
-  const res = await post('/research', { workspaceId: boot.workspace.id, topic: '新能源' });
+test('Phase 3 未交付能力返回明确说明而非静默失败', async () => {
+  const res = await post('/website/deploy', { workspaceId: boot.workspace.id, description: 'x', confirm: true });
   const body = await res.json();
   assert.equal(res.status, 400);
-  assert.match(body.error.message, /Phase 2/);
+  assert.equal(body.ok, false);
+  assert.ok(body.error.message.includes('Phase 3'), '未交付能力必须给出明确说明');
 });
 
 test('工具注册表包含 Phase 1 必备工具', async () => {
@@ -568,4 +569,104 @@ test('Phase 2 Office 安全边界：路径穿越与非法参数被拒绝', async
   assert.equal(bad.status, 400);
   const badBody = await bad.json();
   assert.equal(badBody.error.code, 'BAD_REQUEST');
+});
+
+/* ------------------------------------------------------------------ */
+/* Phase 2 Step 6：深度研究接口                                         */
+/* ------------------------------------------------------------------ */
+
+test('Phase 2 GET /research/capability 如实告知联网能力', async () => {
+  const res = await get('/research/capability');
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.equal(typeof body.data.network, 'boolean');
+  assert.ok(body.data.hint.length > 0);
+});
+
+test('Phase 2 POST /research 未允许联网时走本地/待核查路径，流程仍完整', async () => {
+  const res = await post('/research', {
+    workspaceId: boot.workspace.id,
+    topic: 'Phase2 测试主题：储能装机量',
+    depth: 'quick',
+    allowNetwork: false,
+    outputFormats: ['markdown'],
+  });
+  const body = await res.json();
+  assert.equal(res.status, 201);
+  assert.equal(body.data.job.allowNetwork, false, '必须记录未允许联网');
+  assert.ok(body.data.job.queries.length > 0);
+
+  // 后台异步执行，轮询到终态
+  const jobId = body.data.job.id;
+  let final: { status: string; progress: number; error?: string | null } | null = null;
+  for (let i = 0; i < 60; i++) {
+    const r = await get(`/research/${jobId}`);
+    const b = await r.json();
+    final = b.data.job;
+    if (['completed', 'failed', 'cancelled'].includes(final!.status)) break;
+    await new Promise((r2) => setTimeout(r2, 200));
+  }
+  assert.ok(final, '应能查询到研究任务');
+  assert.equal(final!.status, 'completed', `离线研究应可完成，实际 ${final!.status}：${final!.error ?? ''}`);
+  assert.equal(final!.progress, 100);
+});
+
+test('Phase 2 GET /research/:id 返回任务/来源/论断/报告', async () => {
+  const created = await post('/research', { workspaceId: boot.workspace.id, topic: '接口结构校验主题', depth: 'quick', allowNetwork: false });
+  const jobId = (await created.json()).data.job.id;
+  let detail: { job: { status: string }; sources: unknown[]; claims: unknown[]; report: unknown } | null = null;
+  for (let i = 0; i < 60; i++) {
+    const r = await get(`/research/${jobId}`);
+    detail = (await r.json()).data;
+    if (['completed', 'failed'].includes(detail!.job.status)) break;
+    await new Promise((r2) => setTimeout(r2, 200));
+  }
+  assert.ok(Array.isArray(detail!.sources));
+  assert.ok(Array.isArray(detail!.claims));
+
+  const reportRes = await get(`/research/${jobId}/report`);
+  const reportBody = await reportRes.json();
+  assert.equal(reportRes.status, 200);
+  assert.ok(reportBody.data.report.markdown.includes('## 参考文献'));
+  assert.ok(reportBody.data.report.references.length > 0);
+});
+
+test('Phase 2 GET /research/:id/export 可直接下载 Markdown', async () => {
+  const jobs = await get(`/research?workspaceId=${boot.workspace.id}`);
+  const list = (await jobs.json()).data.jobs;
+  const done = list.find((j: { status: string }) => j.status === 'completed');
+  assert.ok(done, '应存在已完成的研究');
+  const res = await get(`/research/${done.id}/export`);
+  assert.equal(res.status, 200);
+  assert.ok((res.headers.get('content-type') ?? '').includes('text/markdown'));
+  assert.ok((await res.text()).includes('#'));
+});
+
+test('Phase 2 POST /research/:id/publish 返回可访问的网页地址', async () => {
+  const jobs = await get(`/research?workspaceId=${boot.workspace.id}`);
+  const done = (await jobs.json()).data.jobs.find((j: { status: string }) => j.status === 'completed');
+  const res = await post(`/research/${done.id}/publish`, { public: false });
+  const body = await res.json();
+  assert.equal(res.status, 200);
+  assert.ok(body.data.webUrl.length > 0);
+  assert.ok(body.data.reportId.length > 0);
+});
+
+test('Phase 2 研究报告尚无报告时返回 404 且错误格式统一', async () => {
+  const created = await post('/research', { workspaceId: boot.workspace.id, topic: '空报告校验主题', depth: 'quick', allowNetwork: false });
+  const jobId = (await created.json()).data.job.id;
+  // 立即查询（可能还没生成报告）
+  const res = await get(`/research/${jobId}/report`);
+  if (res.status === 404) {
+    const body = await res.json();
+    assert.equal(body.error.code, 'NOT_FOUND');
+    assert.ok(body.error.message.includes('尚未生成'));
+  }
+});
+
+test('Phase 2 POST /research 参数校验：非法深度被拒绝', async () => {
+  const res = await post('/research', { workspaceId: boot.workspace.id, topic: 'x', depth: 'ultra' });
+  assert.equal(res.status, 400);
+  const body = await res.json();
+  assert.equal(body.error.code, 'BAD_REQUEST');
 });
