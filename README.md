@@ -609,3 +609,72 @@ test/phase4-perf.test.ts        16  10000 项分片 / 1000 节点 DAG / 20000 �
 | `docs/phase4-prompt-engineering.md` | 九要素、变量、生成器、优化器、版本、A/B 判定规则 |
 | `docs/phase4-security-audit.md` | 信任边界、35 类危险动作、凭据保护、SSRF、RBAC、脱敏、审计 |
 | `docs/phase4-rollback.md` | L1~L5 分级回滚 + 各 Step 独立回滚矩阵 + 验证清单 |
+
+---
+
+## Phase 5：桌面版壳层（功能集合与桌面 UI）
+
+> 把 Phase 1~4 的 17 个功能收进一个真正的桌面应用外壳：侧边栏 + 多标签工作区 + 命令面板 + 状态栏。
+
+### 解决的问题
+
+| 之前 | 现在 |
+| --- | --- |
+| 17 个入口平铺一长条，无分组无搜索 | 5 组可折叠侧边栏 + `Ctrl/Cmd+K` 中英关键词搜索 |
+| 跨页对比要来回点，回不去 | 多标签工作区，`Ctrl/Cmd+W` 关闭、`Ctrl/Cmd+Tab` 轮换、`Ctrl/Cmd+1..9` 直选 |
+| 手写 if/else 导航，加页面易漏改 | `nav-config` 唯一数据源 + `Record<TabKey, ComponentType>` 类型安全注册表 |
+| 部分页面没有标题，不知道用途 | 统一页头：功能名 + 一句话用途 + 右侧动作 |
+| 状态下沉在各页面，无处看全局 | 底部状态栏：连接 / 降级 / Agent 数 / 工作区目录 / 当前功能 |
+| 每次打开都从默认页开始 | 标签、侧边栏形态、分组折叠、最近使用全部持久化 |
+
+### 功能集合（17 项 / 5 组）
+
+```
+工作台        对话 · 目标模式 · 看板编辑器 · 文件工作区 · Office 工作区 · 深度研究
+智能体        记忆面板 · Agent 集群 · 多节点集群 · 提示词工作台
+交付与自动化  部署中心 · 数据库面板 · 付费数据库 · 定时任务 · 通知设置
+生态与集群    插件市场 · 安全中心
+系统          设置
+```
+
+### 目录
+
+```
+packages/desktop/src/
+  nav/nav-config.ts              功能清单（唯一数据源）+ 命令面板搜索
+  pages/registry/index.tsx       功能 → 页面组件（类型安全）
+  components/shell/              Sidebar · TabBar · tab-state · CommandPalette
+                                 StatusBar · PageHeader · use-shell
+  App.tsx                        仅负责组装
+```
+
+### 快捷键
+
+| 快捷键 | 动作 |
+| --- | --- |
+| `Ctrl/Cmd + K` | 打开命令面板 |
+| `Ctrl/Cmd + W` | 关闭当前标签（自动激活邻居） |
+| `Ctrl/Cmd + Tab` | 标签轮换（`Shift` 反向） |
+| `Ctrl/Cmd + 1..9` | 直选第 N 个标签 |
+| 鼠标中键 | 关闭标签 |
+
+### 测试
+
+`nav-config.test.ts` 是**功能集合的守门测试**：17 个能力逐个断言存在，key 唯一，每项必须有分组/图标/关键词/说明。
+意义不是覆盖率，而是防止功能悄悄从导航消失 —— 用户看不到入口 = 功能不存在。
+
+`tab-state.test.ts` 覆盖标签栏纯逻辑：重复打开不重复、关闭优先右邻居/末尾回退、关最后一个保留兜底页。
+
+```
+pnpm --filter @ai/desktop test      # 22 通过
+pnpm --filter @ai/desktop build     # 447.53 kB / gzip 130.99 kB
+```
+
+### 文档
+
+`docs/desktop-shell.md`：分层结构、桌面手感清单、视觉 token、测试说明、已下线简版页面清单。
+
+### 已下线的 4 个简版页面
+
+`DashboardPage` / `SchedulePage` / `PluginsPage` / `PromptPage` 从导航移除（文件保留、可回滚），
+能力由 Phase 3/4 的正式页面完整承担，避免出现两套入口让用户不知道该点哪个。
