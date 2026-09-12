@@ -29,7 +29,11 @@ main:
               set -euo pipefail
               corepack enable
               corepack prepare pnpm@9.12.0 --activate
-              pnpm install --no-frozen-lockfile
+              # 必须严格按 pnpm-lock.yaml 安装：
+              # 锁文件里 better-sqlite3 固定在 13.0.3（修复了原生 finalizer 断言崩溃），
+              # 一旦回退到 11.x，node --test 退出阶段会概率性 SIGABRT
+              # （Assertion failed: (env) != nullptr，DECISIONS.md 决策 7）。
+              pnpm install --frozen-lockfile
             '
 
         - name: typecheck
@@ -61,7 +65,11 @@ main:
               set -euo pipefail
               corepack enable
               corepack prepare pnpm@9.12.0 --activate
-              pnpm install --no-frozen-lockfile
+              # 必须严格按 pnpm-lock.yaml 安装：
+              # 锁文件里 better-sqlite3 固定在 13.0.3（修复了原生 finalizer 断言崩溃），
+              # 一旦回退到 11.x，node --test 退出阶段会概率性 SIGABRT
+              # （Assertion failed: (env) != nullptr，DECISIONS.md 决策 7）。
+              pnpm install --frozen-lockfile
             '
 
         - name: typecheck
