@@ -45,10 +45,6 @@ main:
         - name: verify-rollback
           script: pnpm --filter @ai/server verify:rollback && pnpm --filter @ai/server verify:phase4
 
-        - name: verify-rollback
-          # Phase 2/3/4 迁移回滚与功能开关验证
-          script: pnpm --filter @ai/server verify:rollback && pnpm --filter @ai/server verify:phase4
-
         - name: build-desktop
           script: pnpm --filter @ai/desktop build
 

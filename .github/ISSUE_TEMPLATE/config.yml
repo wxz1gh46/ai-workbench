@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: 安全漏洞（请勿公开提交）
+    url: https://github.com/wxz1gh46/ai-workbench/security/advisories/new
+    about: 发现安全问题请走私下报告渠道，详见 SECURITY.md
+  - name: 使用与开发问题
+    url: https://github.com/wxz1gh46/ai-workbench/blob/main/README.md
+    about: 先查阅 README 与 docs/ 目录
